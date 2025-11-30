@@ -1,5 +1,4 @@
 import org.apache.tools.ant.filters.FixCrLfFilter
-
 import java.nio.file.Paths
 import java.nio.file.Files
 
@@ -33,10 +32,6 @@ repositories {
     mavenLocal()
 }
 
-// 引入 AGP 8.x 的 Artifact API 类
-import com.android.build.api.artifact.Artifact
-import com.android.build.api.variant.LibraryPackaging
-
 afterEvaluate {
     android.libraryVariants.forEach { variant ->
         def variantCapped = variant.name.capitalize()
@@ -68,45 +63,27 @@ afterEvaluate {
                         eol: FixCrLfFilter.CrLf.newInstance("lf"))
             }
 
-            // ***************************************************************
-            // *** 核心修改部分：使用 AGP 8.x Artifact API 获取 JNI 库路径 ***
-            // ***************************************************************
+            // *****************************************************************
+            // *** 核心修改部分：使用旧版 API 兼容的方式获取 JNI 库路径 ***
+            // *****************************************************************
             
-            // 获取所有 JNI 库的目录，AGP 8.x 推荐使用 LibraryPackaging.JNI_LIBS_JNI_DIRECTORIES
-            // 这会返回一个 Provider，指向包含所有 ABI 目录的父目录
-            def jniLibsDirs = variant.artifacts.get(LibraryPackaging.JNI_LIBS_JNI_DIRECTORIES)
-            
-            from(jniLibsDirs) {
-                // 如果 jniLibsDirs 是 Provider<Directory>，它应该包含 /arm64-v8a, /armeabi-v7a 等子目录
-                // 我们将这些子目录复制到 'lib' 目录下
+            // 使用 variant.mergeJniLibFolders，它是一个 FileCollection，包含了所有 ABI 的 JNI 目录
+            from(variant.mergeJniLibFolders) {
                 into 'lib'
             }
+            
+            // *****************************************************************
 
-            // ***************************************************************
-            // *** 修正后的 doLast 块 ***
-            // ***************************************************************
             doLast {
                 file("$magiskDir/zygisk").mkdir()
-                
-                // 遍历 lib 目录下的所有 ABI 目录
                 fileTree("$magiskDir/lib").visit { f ->
-                    if (!f.directory) return // 跳过文件
-                    
-                    // 假设 f.file 是 /magisk_module_release/lib/arm64-v8a
-                    
-                    // 构建源路径：/lib/arm64-v8a/lib{moduleLibraryName}.so
+                    if (!f.directory) return
                     def srcPath = Paths.get("${f.file.absolutePath}/lib${moduleLibraryName}.so")
-                    
-                    // 获取 ABI 名称 (例如 arm64-v8a)
-                    def abiName = f.name 
-                    
-                    // 构建目标路径：/zygisk/{abiName}.so
+                    def abiName = f.name
                     def dstPath = Paths.get("$magiskDir/zygisk/${abiName}.so")
-                    
                     if (Files.exists(srcPath)) {
                         Files.move(srcPath, dstPath)
                     } else {
-                        // 打印警告或错误，如果找不到 .so 文件，可能是 CMake 配置问题
                         println("Warning: Native library not found at ${srcPath}")
                     }
                 }
