@@ -2,8 +2,6 @@ import org.apache.tools.ant.filters.FixCrLfFilter
 import java.nio.file.Paths
 import java.nio.file.Files
 
-// *** 删除了这里的 import 语句 ***
-
 apply plugin: 'com.android.library'
 apply from: file(rootProject.file('module.gradle'))
 
@@ -35,7 +33,10 @@ repositories {
 }
 
 androidComponents {
-    onVariants(selector().all()) { variant ->
+    // *******************************************************************
+    // *** 核心修改：只对 release 构建类型应用自定义任务 ***
+    // *******************************************************************
+    onVariants(selector().withBuildType("release")) { variant ->
         def variantCapped = variant.name.capitalize()
         def variantLowered = variant.name.toLowerCase()
 
@@ -43,7 +44,8 @@ androidComponents {
         def magiskDir = file("$outDir/magisk_module_$variantLowered")
 
         def prepareTask = tasks.register("prepareMagiskFiles${variantCapped}", Sync) {
-            dependsOn("assemble${variantCapped}")
+            // 移除这个显式依赖，因为 Artifacts API 会自动处理依赖关系
+            // dependsOn("assemble${variantCapped}")
 
             def templatePath = "$rootDir/template/magisk_module"
 
@@ -65,9 +67,6 @@ androidComponents {
                         eol: FixCrLfFilter.CrLf.newInstance("lf"))
             }
 
-            // *******************************************************************
-            // *** 核心修改：在这里使用完全限定名称 ***
-            // *******************************************************************
             def jniLibsDirs = variant.artifacts.get(com.android.build.api.variant.LibraryPackaging.JNI_LIBS_JNI_DIRECTORIES)
             from(jniLibsDirs) {
                 into 'lib'
@@ -96,11 +95,13 @@ androidComponents {
             archiveFileName.set(zipName)
             destinationDirectory.set(outDir)
         }
-
+        
+        // 现在可以安全地配置 assembleRelease 任务，因为它肯定存在
         tasks.named("assemble${variantCapped}").configure {
             it.finalizedBy(zipTask)
         }
 
+        // adb 任务也只会为 release 创建
         def pushTask = tasks.register("push${variantCapped}", Exec) {
             dependsOn(zipTask)
             workingDir outDir
