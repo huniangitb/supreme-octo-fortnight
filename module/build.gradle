@@ -40,6 +40,11 @@ androidComponents {
         def zipName = "${magiskModuleId.replace('_', '-')}-${moduleVersion}-${variantLowered}.zip"
         def magiskDir = file("$outDir/magisk_module_$variantLowered")
 
+        // *******************************************************************
+        // *** 核心修改：将 jniLibsDirs 的定义移出 task 注册块 ***
+        // *******************************************************************
+        def jniLibsDirs = variant.artifacts.get(com.android.build.api.variant.LibraryPackaging.JNI_LIBS_JNI_DIRECTORIES)
+
         def prepareTask = tasks.register("prepareMagiskFiles${variantCapped}", Sync) {
             def templatePath = "$rootDir/template/magisk_module"
             into magiskDir
@@ -60,7 +65,7 @@ androidComponents {
                         eol: FixCrLfFilter.CrLf.newInstance("lf"))
             }
 
-            def jniLibsDirs = variant.artifacts.get(com.android.build.api.variant.LibraryPackaging.JNI_LIBS_JNI_DIRECTORIES)
+            // 现在在这里安全地使用变量
             from(jniLibsDirs) {
                 into 'lib'
             }
@@ -88,9 +93,6 @@ androidComponents {
             archiveFileName.set(zipName)
             destinationDirectory.set(outDir)
         }
-
-        // *** 我们删除了 finalizedBy(zipTask) 的那段代码 ***
-        // 您的 adb 任务仍然可以正常工作，因为它们依赖于 zipTask
 
         def pushTask = tasks.register("push${variantCapped}", Exec) {
             dependsOn(zipTask)
