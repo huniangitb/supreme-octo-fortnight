@@ -21,8 +21,7 @@ jobs:
       with:
         gradle-version: '8.7'
     - run: |
-        chmod +x module/copy_native_libs.sh
-        gradle :module:zipRelease
+        gradle :module:assembleRelease
     - uses: actions/upload-artifact@v4 
       with:
         name: zygisk-imgui-modmenu
