@@ -1,6 +1,9 @@
 import org.apache.tools.ant.filters.FixCrLfFilter
 import java.nio.file.Paths
 import java.nio.file.Files
+// 引入新的 Artifacts API
+import com.android.build.api.artifact.Artifact
+import com.android.build.api.variant.LibraryPackaging
 
 apply plugin: 'com.android.library'
 apply from: file(rootProject.file('module.gradle'))
@@ -32,16 +35,22 @@ repositories {
     mavenLocal()
 }
 
-afterEvaluate {
-    android.libraryVariants.forEach { variant ->
+// *****************************************************************
+// *** 核心修改：使用新的 androidComponents API 替换 afterEvaluate ***
+// *****************************************************************
+androidComponents {
+    // onVariants 选择器可以选择所有变体，或者用 withBuildType('release') 只选择 release
+    onVariants(selector().all()) { variant ->
         def variantCapped = variant.name.capitalize()
         def variantLowered = variant.name.toLowerCase()
 
         def zipName = "${magiskModuleId.replace('_', '-')}-${moduleVersion}-${variantLowered}.zip"
         def magiskDir = file("$outDir/magisk_module_$variantLowered")
 
-        task("prepareMagiskFiles${variantCapped}", type: Sync) {
-            dependsOn("assemble$variantCapped")
+        // 1. 注册 prepareMagiskFiles 任务
+        def prepareTask = tasks.register("prepareMagiskFiles${variantCapped}", Sync) {
+            // assemble 任务会自动触发原生代码的编译
+            dependsOn("assemble${variantCapped}")
 
             def templatePath = "$rootDir/template/magisk_module"
 
@@ -63,16 +72,11 @@ afterEvaluate {
                         eol: FixCrLfFilter.CrLf.newInstance("lf"))
             }
 
-            // *****************************************************************
-            // *** 核心修改部分：使用旧版 API 兼容的方式获取 JNI 库路径 ***
-            // *****************************************************************
-            
-            // 使用 variant.mergeJniLibFolders，它是一个 FileCollection，包含了所有 ABI 的 JNI 目录
-            from(variant.mergeJniLibFolders) {
+            // 使用新的 Artifacts API 获取 JNI 库，这次它会正常工作
+            def jniLibsDirs = variant.artifacts.get(LibraryPackaging.JNI_LIBS_JNI_DIRECTORIES)
+            from(jniLibsDirs) {
                 into 'lib'
             }
-            
-            // *****************************************************************
 
             doLast {
                 file("$magiskDir/zygisk").mkdir()
@@ -91,30 +95,36 @@ afterEvaluate {
             }
         }
 
-        task("zip${variantCapped}", type: Zip) {
-            dependsOn("prepareMagiskFiles${variantCapped}")
+        // 2. 注册 zip 任务
+        def zipTask = tasks.register("zip${variantCapped}", Zip) {
+            dependsOn(prepareTask) // 明确依赖 prepareTask
             from magiskDir
             archiveFileName.set(zipName)
             destinationDirectory.set(outDir)
         }
 
-        task("push${variantCapped}", type: Exec) {
-            dependsOn("zip${variantCapped}")
+        // 3. 将 zip 任务附加到构建流程的末尾
+        // 找到 assemble 任务，并在它完成后执行我们的 zip 任务
+        tasks.named("assemble${variantCapped}").configure {
+            it.finalizedBy(zipTask)
+        }
+
+        // 4. (可选) 注册其他 adb 任务
+        def pushTask = tasks.register("push${variantCapped}", Exec) {
+            dependsOn(zipTask)
             workingDir outDir
             commandLine android.adbExecutable, "push", zipName, "/data/local/tmp/"
         }
 
-        task("flash${variantCapped}", type: Exec) {
-            dependsOn("push${variantCapped}")
+        def flashTask = tasks.register("flash${variantCapped}", Exec) {
+            dependsOn(pushTask)
             commandLine android.adbExecutable, "shell", "su", "-c",
                     "magisk --install-module /data/local/tmp/${zipName}"
         }
 
-        task("flashAndReboot${variantCapped}", type: Exec) {
-            dependsOn("flash${variantCapped}")
+        tasks.register("flashAndReboot${variantCapped}", Exec) {
+            dependsOn(flashTask)
             commandLine android.adbExecutable, "shell", "reboot"
         }
-
-        variant.assembleProvider.get().finalizedBy("zip${variantCapped}")
     }
 }
