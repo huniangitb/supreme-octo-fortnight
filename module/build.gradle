@@ -32,13 +32,13 @@ repositories {
     mavenLocal()
 }
 
-androidComponents {
-    // *******************************************************************
-    // *** 核心修复：在 onVariants 外部的安全作用域中获取 Artifact 类型 ***
-    // *******************************************************************
-    // 在这里，Groovy 会正确地将下面的 FQN 解析为一个 Java 类
-    def jniLibsArtifact = com.android.build.api.variant.LibraryPackaging.JNI_LIBS_JNI_DIRECTORIES
+// *******************************************************************
+// *** 核心修复：在所有特殊闭包之外的顶层作用域中定义变量 ***
+// *******************************************************************
+// 在这里，脚本的上下文是 Project 对象，Groovy 会正确地将 FQN 解析为 Java 类。
+def jniLibsArtifactType = com.android.build.api.variant.LibraryPackaging.JNI_LIBS_JNI_DIRECTORIES
 
+androidComponents {
     onVariants(selector().withBuildType("release")) { variant ->
         def variantCapped = variant.name.capitalize()
         def variantLowered = variant.name.toLowerCase()
@@ -47,7 +47,7 @@ androidComponents {
         def magiskDir = file("$outDir/magisk_module_$variantLowered")
 
         // 然后在这里安全地使用上面定义的变量
-        def jniLibsDirs = variant.artifacts.get(jniLibsArtifact)
+        def jniLibsDirs = variant.artifacts.get(jniLibsArtifactType)
 
         def prepareTask = tasks.register("prepareMagiskFiles${variantCapped}", Sync) {
             def templatePath = "$rootDir/template/magisk_module"
