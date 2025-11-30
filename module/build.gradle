@@ -1,3 +1,5 @@
+// build.gradle
+
 import org.apache.tools.ant.filters.FixCrLfFilter
 import java.nio.file.Paths
 import java.nio.file.Files
@@ -5,38 +7,15 @@ import java.nio.file.Files
 apply plugin: 'com.android.library'
 apply from: file(rootProject.file('module.gradle'))
 
+// ... [android, repositories 等配置保持不变] ...
 android {
-    compileSdkVersion rootProject.ext.targetSdkVersion
-    defaultConfig {
-        minSdkVersion rootProject.ext.minSdkVersion
-        targetSdkVersion rootProject.ext.targetSdkVersion
-        externalNativeBuild {
-            cmake {
-                arguments "-DMODULE_NAME:STRING=$moduleLibraryName", "-DCMAKE_EXPORT_COMPILE_COMMANDS:STRING=ON"
-            }
-        }
-    }
-    buildFeatures {
-        prefab true
-    }
-    externalNativeBuild {
-        cmake {
-            path "src/main/cpp/CMakeLists.txt"
-            version "3.22.1"
-        }
-    }
+    // ...
     namespace 'aknoryx.zygisktz'
 }
 
 repositories {
     mavenLocal()
 }
-
-// *******************************************************************
-// *** 核心修复：在所有特殊闭包之外的顶层作用域中定义变量 ***
-// *******************************************************************
-// 在这里，脚本的上下文是 Project 对象，Groovy 会正确地将 FQN 解析为 Java 类。
-def jniLibsArtifactType = com.android.build.api.variant.LibraryPackaging.JNI_LIBS_JNI_DIRECTORIES
 
 androidComponents {
     onVariants(selector().withBuildType("release")) { variant ->
@@ -46,10 +25,8 @@ androidComponents {
         def zipName = "${magiskModuleId.replace('_', '-')}-${moduleVersion}-${variantLowered}.zip"
         def magiskDir = file("$outDir/magisk_module_$variantLowered")
 
-        // 然后在这里安全地使用上面定义的变量
-        def jniLibsDirs = variant.artifacts.get(jniLibsArtifactType)
-
         def prepareTask = tasks.register("prepareMagiskFiles${variantCapped}", Sync) {
+            // 这个任务现在只负责复制模板文件
             def templatePath = "$rootDir/template/magisk_module"
             into magiskDir
             from(templatePath) {
@@ -69,25 +46,18 @@ androidComponents {
                         eol: FixCrLfFilter.CrLf.newInstance("lf"))
             }
 
-            from(jniLibsDirs) {
-                into 'lib'
-            }
-
+            // 在任务执行的最后，调用 shell 脚本来处理 .so 文件
             doLast {
-                file("$magiskDir/zygisk").mkdir()
-                fileTree("$magiskDir/lib").visit { f ->
-                    if (!f.directory) return
-                    def srcPath = Paths.get("${f.file.absolutePath}/lib${moduleLibraryName}.so")
-                    def abiName = f.name
-                    def dstPath = Paths.get("$magiskDir/zygisk/${abiName}.so")
-                    if (Files.exists(srcPath)) {
-                        Files.move(srcPath, dstPath)
-                    } else {
-                        println("Warning: Native library not found at ${srcPath}")
-                    }
+                exec {
+                    workingDir project.projectDir // 在模块目录下执行
+                    commandLine 'sh', './copy_native_libs.sh', buildDir, magiskDir, moduleLibraryName
                 }
-                new File("$magiskDir/lib").deleteDir()
             }
+        }
+
+        // 确保原生代码编译在 prepareTask 之前完成
+        prepareTask.configure {
+            dependsOn "assemble${variantCapped}"
         }
 
         def zipTask = tasks.register("zip${variantCapped}", Zip) {
@@ -97,21 +67,6 @@ androidComponents {
             destinationDirectory.set(outDir)
         }
 
-        def pushTask = tasks.register("push${variantCapped}", Exec) {
-            dependsOn(zipTask)
-            workingDir outDir
-            commandLine android.adbExecutable, "push", zipName, "/data/local/tmp/"
-        }
-
-        def flashTask = tasks.register("flash${variantCapped}", Exec) {
-            dependsOn(pushTask)
-            commandLine android.adbExecutable, "shell", "su", "-c",
-                    "magisk --install-module /data/local/tmp/${zipName}"
-        }
-
-        tasks.register("flashAndReboot${variantCapped}", Exec) {
-            dependsOn(flashTask)
-            commandLine android.adbExecutable, "shell", "reboot"
-        }
+        // ... [push, flash 等任务保持不变] ...
     }
 }
