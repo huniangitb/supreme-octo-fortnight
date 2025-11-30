@@ -3,6 +3,9 @@ import java.nio.file.Paths
 import java.nio.file.Files
 
 apply plugin: 'com.android.library'
+// *** IMPORT STATEMENT MOVED HERE, AFTER THE PLUGIN IS APPLIED ***
+import com.android.build.api.variant.LibraryPackaging
+
 apply from: file(rootProject.file('module.gradle'))
 
 android {
@@ -40,10 +43,7 @@ androidComponents {
         def zipName = "${magiskModuleId.replace('_', '-')}-${moduleVersion}-${variantLowered}.zip"
         def magiskDir = file("$outDir/magisk_module_$variantLowered")
 
-        // *******************************************************************
-        // *** 核心修改：将 jniLibsDirs 的定义移出 task 注册块 ***
-        // *******************************************************************
-        def jniLibsDirs = variant.artifacts.get(com.android.build.api.variant.LibraryPackaging.JNI_LIBS_JNI_DIRECTORIES)
+        def jniLibsDirs = variant.artifacts.get(LibraryPackaging.JNI_LIBS_JNI_DIRECTORIES)
 
         def prepareTask = tasks.register("prepareMagiskFiles${variantCapped}", Sync) {
             def templatePath = "$rootDir/template/magisk_module"
@@ -65,7 +65,6 @@ androidComponents {
                         eol: FixCrLfFilter.CrLf.newInstance("lf"))
             }
 
-            // 现在在这里安全地使用变量
             from(jniLibsDirs) {
                 into 'lib'
             }
