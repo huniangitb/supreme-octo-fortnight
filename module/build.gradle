@@ -3,9 +3,6 @@ import java.nio.file.Paths
 import java.nio.file.Files
 
 apply plugin: 'com.android.library'
-// *** IMPORT STATEMENT MOVED HERE, AFTER THE PLUGIN IS APPLIED ***
-import com.android.build.api.variant.LibraryPackaging
-
 apply from: file(rootProject.file('module.gradle'))
 
 android {
@@ -36,6 +33,12 @@ repositories {
 }
 
 androidComponents {
+    // *******************************************************************
+    // *** 核心修复：在 onVariants 外部的安全作用域中获取 Artifact 类型 ***
+    // *******************************************************************
+    // 在这里，Groovy 会正确地将下面的 FQN 解析为一个 Java 类
+    def jniLibsArtifact = com.android.build.api.variant.LibraryPackaging.JNI_LIBS_JNI_DIRECTORIES
+
     onVariants(selector().withBuildType("release")) { variant ->
         def variantCapped = variant.name.capitalize()
         def variantLowered = variant.name.toLowerCase()
@@ -43,7 +46,8 @@ androidComponents {
         def zipName = "${magiskModuleId.replace('_', '-')}-${moduleVersion}-${variantLowered}.zip"
         def magiskDir = file("$outDir/magisk_module_$variantLowered")
 
-        def jniLibsDirs = variant.artifacts.get(LibraryPackaging.JNI_LIBS_JNI_DIRECTORIES)
+        // 然后在这里安全地使用上面定义的变量
+        def jniLibsDirs = variant.artifacts.get(jniLibsArtifact)
 
         def prepareTask = tasks.register("prepareMagiskFiles${variantCapped}", Sync) {
             def templatePath = "$rootDir/template/magisk_module"
