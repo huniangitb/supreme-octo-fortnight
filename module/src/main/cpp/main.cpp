@@ -10,41 +10,52 @@
 // 引入 Zygisk V4 头文件
 #include "zygisk.hpp"
 
+// 定义日志 TAG 和宏
 #define LOG_TAG "Zygisk_IPC"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 // 获取进程名的系统函数声明
 extern "C" const char* getprogname();
 
 // -----------------------------------------------------------------------------
-// IPC 发送逻辑 (保持不变)
+// IPC 发送逻辑
 // -----------------------------------------------------------------------------
 static int connect_and_send(const char* name) {
     int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sockfd < 0) {
-        LOGE("socket() failed: %s", strerror(errno));
+        LOGE("[IPC] socket() failed: %s", strerror(errno));
         return -1;
     }
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    // 确保这个路径与你的服务端监听路径一致
-    strncpy(addr.sun_path, "/data/Namespace-Proxy/ipc.sock", sizeof(addr.sun_path) - 1);
+    // 目标 Socket 路径
+    const char* socket_path = "/data/Namespace-Proxy/ipc.sock";
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+
+    LOGD("[IPC] Connecting to %s for package: %s", socket_path, name);
 
     if (connect(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        // 连接失败通常是因为接收端没启动，视为 Debug 信息
-        LOGD("connect() failed (Injector might be offline): %s", strerror(errno));
+        // 连接失败通常是因为接收端没启动，或者权限不足
+        LOGW("[IPC] connect() failed: %s. (Is the proxy server running?)", strerror(errno));
         close(sockfd);
         return -1;
     }
 
     char buffer[256];
+    // 格式化发送内容： 包名 PID
     int len = snprintf(buffer, sizeof(buffer), "%s %d", name, getpid());
     if (len > 0) {
-        write(sockfd, buffer, len);
-        LOGD("IPC Sent: %s", buffer);
+        ssize_t sent = write(sockfd, buffer, len);
+        if (sent > 0) {
+            LOGI("[IPC] Success! Sent: '%s'", buffer);
+        } else {
+            LOGE("[IPC] write() failed: %s", strerror(errno));
+        }
     }
 
     close(sockfd);
@@ -61,51 +72,67 @@ public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
         this->api = api;
         this->env = env;
+        // 打印一条日志证明模块被 Zygisk 框架加载了
+        LOGD("onLoad: Module loaded into process PID=%d", getpid());
     }
 
     // preAppSpecialize 在进程被 fork 出来但尚未应用沙盒限制时调用 (具有 root 权限)
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        // [实现隐藏的核心部分]
+        LOGD("preAppSpecialize: Applying hide options...");
         
-        // 1. FORCE_DENYLIST_UNMOUNT:
-        // 强制对此进程执行 Magisk/KernelSU 的“排除列表”卸载逻辑。
-        // 无论用户是否将该应用添加到排除列表，都会移除模块的文件挂载。
+        // 1. 强制卸载挂载点 (解决文件检测)
         api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
 
-        // 2. DLCLOSE_MODULE_LIBRARY:
-        // 在 postAppSpecialize 执行完毕后，自动 dlclose 本模块的 .so 文件。
-        // 这会清除内存映射 (/proc/self/maps) 中的模块痕迹。
-        // 注意：启用此项后，不能在 post 阶段之后保留任何 Hook (如 PLT Hook 或 Native Hook)。
-        // 由于本模块只发一次 IPC，不需要持久驻留，所以这是最佳隐藏方案。
+        // 2. 任务完成后自动卸载库 (解决内存检测)
         api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
     }
 
     // postAppSpecialize 在进程沙盒化完成后调用 (应用权限)
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        // 1. 获取当前进程名
-        const char* name = getprogname();
-        
-        // 2. 过滤掉 zygote 自身和 app_process
-        if (name == nullptr || strstr(name, "zygote") != nullptr || strcmp(name, "app_process") == 0) {
+        // 1. 尝试获取准确的 Java 包名
+        const char* process_name = nullptr;
+        bool need_release = false;
+
+        if (args->nice_name) {
+            process_name = env->GetStringUTFChars(args->nice_name, nullptr);
+            need_release = true;
+        }
+
+        // 如果获取不到 Java 包名，降级使用系统进程名
+        if (process_name == nullptr) {
+            process_name = getprogname();
+        }
+
+        if (process_name == nullptr) {
+            process_name = "unknown_process";
+        }
+
+        // 2. 过滤逻辑：跳过 Zygote 和 app_process
+        // 注意：这里只是为了避免向 Zygote 发送请求，Zygisk 本身已经注入进来了
+        if (strstr(process_name, "zygote") != nullptr || 
+            strcmp(process_name, "app_process") == 0 || 
+            strcmp(process_name, "app_process64") == 0) {
+            
+            LOGD("postAppSpecialize: Skipping system process: %s", process_name);
+            
+            // 别忘了释放 JNI 字符串
+            if (need_release && args->nice_name) {
+                env->ReleaseStringUTFChars(args->nice_name, process_name);
+            }
             return; 
         }
 
-        // 3. (可选) 你也可以使用 args->nice_name 获取包名，这比 getprogname 更准确
-        // 但为了兼容你原有的逻辑，这里保留 getprogname，或者两者结合
-        const char* final_name = name;
-        if (args->nice_name) {
-            // 将 jstring 转换为 C string (简单示例，未处理释放)
-            // const char* nice_name_c = env->GetStringUTFChars(args->nice_name, nullptr);
-            // final_name = nice_name_c;
-            // (注意：如果在 DLCLOSE 模式下，尽量减少复杂的 JNI 操作，直接用 getprogname 足够简单有效)
+        LOGI("postAppSpecialize: Target found: %s (PID: %d)", process_name, getpid());
+
+        // 3. 发送 IPC
+        connect_and_send(process_name);
+
+        // 4. 清理 JNI 资源
+        if (need_release && args->nice_name) {
+            env->ReleaseStringUTFChars(args->nice_name, process_name);
         }
 
-        LOGD("Module specialized in: %s (PID: %d)", final_name, getpid());
-
-        // 4. 发送 IPC
-        connect_and_send(final_name);
-
-        // 函数返回后，由于设置了 DLCLOSE_MODULE_LIBRARY，模块将从内存中消失
+        // 函数返回后，由于设置了 DLCLOSE_MODULE_LIBRARY，模块将从内存中自动卸载
     }
 
 private:
@@ -113,5 +140,5 @@ private:
     JNIEnv *env;
 };
 
-// 注册 Zygisk 模块 (V4 API 使用相同的宏)
+// 注册 Zygisk 模块
 REGISTER_ZYGISK_MODULE(NamespaceProxyModule)
