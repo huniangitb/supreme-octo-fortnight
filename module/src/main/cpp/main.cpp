@@ -6,90 +6,101 @@
 #include <cstring>
 #include <cerrno>
 #include <cstdlib>
+#include <string>
+#include <vector>
 
-// 引入 Zygisk V4 头文件
 #include "zygisk.hpp"
 
-// 定义日志 TAG 和宏
 #define LOG_TAG "Zygisk_IPC"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
-// 获取进程名的系统函数声明
+// 目标外部 Socket 路径
+static const char* TARGET_SOCKET_PATH = "/data/Namespace-Proxy/ipc.sock";
+
 extern "C" const char* getprogname();
 
 // -----------------------------------------------------------------------------
-// IPC 发送逻辑
+// Companion (服务端) 逻辑 - 运行在 Root 环境下
 // -----------------------------------------------------------------------------
-static int connect_and_send(const char* name) {
-    int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sockfd < 0) {
-        LOGE("[IPC] socket() failed: %s", strerror(errno));
-        return -1;
+// 这个函数负责：接收 App 发来的数据 -> 转发给外部 Socket -> 关闭连接
+static void companion_handler(int client_fd) {
+    // 1. 读取 APP 发来的消息
+    char buffer[256];
+    memset(buffer, 0, sizeof(buffer));
+    
+    ssize_t len = read(client_fd, buffer, sizeof(buffer) - 1);
+    if (len <= 0) {
+        close(client_fd);
+        return;
+    }
+    
+    // 收到消息，打印一下
+    LOGD("[Companion] Received from App: %s", buffer);
+
+    // 2. 连接真正的外部 Socket (/data/Namespace-Proxy/ipc.sock)
+    int target_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (target_fd < 0) {
+        LOGE("[Companion] Failed to create socket: %s", strerror(errno));
+        close(client_fd);
+        return;
     }
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    // 目标 Socket 路径
-    const char* socket_path = "/data/Namespace-Proxy/ipc.sock";
-    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, TARGET_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
-    LOGD("[IPC] Connecting to %s for package: %s", socket_path, name);
-
-    if (connect(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        // 连接失败通常是因为接收端没启动，或者权限不足
-        LOGW("[IPC] connect() failed: %s. (Is the proxy server running?)", strerror(errno));
-        close(sockfd);
-        return -1;
+    if (connect(target_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        LOGW("[Companion] Failed to connect to proxy server: %s", strerror(errno));
+        // 这里可以选择不回复客户端，直接断开
+        close(target_fd);
+        close(client_fd);
+        return;
     }
 
-    char buffer[256];
-    // 格式化发送内容： 包名 PID
-    int len = snprintf(buffer, sizeof(buffer), "%s %d", name, getpid());
-    if (len > 0) {
-        ssize_t sent = write(sockfd, buffer, len);
-        if (sent > 0) {
-            LOGI("[IPC] Success! Sent: '%s'", buffer);
-        } else {
-            LOGE("[IPC] write() failed: %s", strerror(errno));
-        }
-    }
+    // 3. 转发数据
+    write(target_fd, buffer, len);
+    LOGI("[Companion] Forwarded to Proxy: %s", buffer);
 
-    close(sockfd);
-    return 0;
+    // 4. 清理
+    close(target_fd);
+    close(client_fd);
 }
 
 // -----------------------------------------------------------------------------
-// Zygisk V4 Module Implementation
+// Module (客户端) 逻辑 - 运行在 APP 进程内
 // -----------------------------------------------------------------------------
 
 class NamespaceProxyModule : public zygisk::ModuleBase {
 public:
-    // onLoad 在模块加载到目标进程时立即调用
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
         this->api = api;
         this->env = env;
-        // 打印一条日志证明模块被 Zygisk 框架加载了
-        LOGD("onLoad: Module loaded into process PID=%d", getpid());
+        this->companion_fd = -1;
     }
 
-    // preAppSpecialize 在进程被 fork 出来但尚未应用沙盒限制时调用 (具有 root 权限)
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        LOGD("preAppSpecialize: Applying hide options...");
-        
-        // 1. 强制卸载挂载点 (解决文件检测)
-        api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
+        // [关键步骤 1] 在沙盒生效前，连接 Companion (Root 进程)
+        // 这个 fd 会被保留到 postAppSpecialize 使用
+        this->companion_fd = api->connectCompanion();
 
-        // 2. 任务完成后自动卸载库 (解决内存检测)
+        if (this->companion_fd < 0) {
+            LOGE("[Module] Failed to connect to Companion!");
+        }
+
+        // [隐藏] 
+        api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
         api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
     }
 
-    // postAppSpecialize 在进程沙盒化完成后调用 (应用权限)
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        // 1. 尝试获取准确的 Java 包名
+        // 如果连接 Companion 失败，直接退出
+        if (this->companion_fd < 0) return;
+
+        // 1. 获取包名
         const char* process_name = nullptr;
         bool need_release = false;
 
@@ -97,48 +108,44 @@ public:
             process_name = env->GetStringUTFChars(args->nice_name, nullptr);
             need_release = true;
         }
+        if (process_name == nullptr) process_name = getprogname();
+        if (process_name == nullptr) process_name = "unknown";
 
-        // 如果获取不到 Java 包名，降级使用系统进程名
-        if (process_name == nullptr) {
-            process_name = getprogname();
-        }
-
-        if (process_name == nullptr) {
-            process_name = "unknown_process";
-        }
-
-        // 2. 过滤逻辑：跳过 Zygote 和 app_process
-        // 注意：这里只是为了避免向 Zygote 发送请求，Zygisk 本身已经注入进来了
+        // 2. 过滤系统进程
         if (strstr(process_name, "zygote") != nullptr || 
             strcmp(process_name, "app_process") == 0 || 
             strcmp(process_name, "app_process64") == 0) {
             
-            LOGD("postAppSpecialize: Skipping system process: %s", process_name);
-            
-            // 别忘了释放 JNI 字符串
-            if (need_release && args->nice_name) {
-                env->ReleaseStringUTFChars(args->nice_name, process_name);
-            }
+            if (need_release && args->nice_name) env->ReleaseStringUTFChars(args->nice_name, process_name);
+            close(this->companion_fd); // 别忘了关闭 fd
             return; 
         }
 
-        LOGI("postAppSpecialize: Target found: %s (PID: %d)", process_name, getpid());
+        LOGI("[Module] Process specialized: %s. Sending to companion...", process_name);
 
-        // 3. 发送 IPC
-        connect_and_send(process_name);
+        // 3. 格式化数据并通过 companion_fd 发送
+        char buffer[256];
+        int msg_len = snprintf(buffer, sizeof(buffer), "%s %d", process_name, getpid());
+        
+        if (msg_len > 0) {
+            write(this->companion_fd, buffer, msg_len);
+        }
 
-        // 4. 清理 JNI 资源
+        // 4. 清理资源
+        close(this->companion_fd); // 发送完即可关闭
         if (need_release && args->nice_name) {
             env->ReleaseStringUTFChars(args->nice_name, process_name);
         }
-
-        // 函数返回后，由于设置了 DLCLOSE_MODULE_LIBRARY，模块将从内存中自动卸载
     }
 
 private:
     zygisk::Api *api;
     JNIEnv *env;
+    int companion_fd; // 保存通往 Root 进程的文件描述符
 };
 
-// 注册 Zygisk 模块
+// 注册模块
 REGISTER_ZYGISK_MODULE(NamespaceProxyModule)
+
+// [关键步骤 2] 注册 Companion 处理函数
+REGISTER_ZYGISK_COMPANION(companion_handler)
