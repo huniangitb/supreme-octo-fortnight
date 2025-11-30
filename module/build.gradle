@@ -22,10 +22,10 @@ android {
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
-            version "3.18.1"
+            version "3.22.1"
         }
     }
-    // 如果您升级AGP，这里需要添加 namespace
+    namespace 'aknoryx.zygisktz'
 }
 
 repositories {
