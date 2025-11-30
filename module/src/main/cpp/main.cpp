@@ -17,36 +17,19 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
-// 目标外部 Socket 路径
 static const char* TARGET_SOCKET_PATH = "/data/Namespace-Proxy/ipc.sock";
-
 extern "C" const char* getprogname();
 
-// -----------------------------------------------------------------------------
-// Companion (服务端) 逻辑 - 运行在 Root 环境下
-// -----------------------------------------------------------------------------
-// 这个函数负责：接收 App 发来的数据 -> 转发给外部 Socket -> 关闭连接
+// Companion (服务端) 逻辑 - 保持不变
 static void companion_handler(int client_fd) {
-    // 1. 读取 APP 发来的消息
-    char buffer[256];
-    memset(buffer, 0, sizeof(buffer));
-    
+    char buffer[256] = {0};
     ssize_t len = read(client_fd, buffer, sizeof(buffer) - 1);
-    if (len <= 0) {
-        close(client_fd);
-        return;
-    }
+    if (len <= 0) { close(client_fd); return; }
     
-    // 收到消息，打印一下
     LOGD("[Companion] Received from App: %s", buffer);
 
-    // 2. 连接真正的外部 Socket (/data/Namespace-Proxy/ipc.sock)
     int target_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (target_fd < 0) {
-        LOGE("[Companion] Failed to create socket: %s", strerror(errno));
-        close(client_fd);
-        return;
-    }
+    if (target_fd < 0) { close(client_fd); return; }
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -54,24 +37,19 @@ static void companion_handler(int client_fd) {
     strncpy(addr.sun_path, TARGET_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
     if (connect(target_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        LOGW("[Companion] Failed to connect to proxy server: %s", strerror(errno));
-        // 这里可以选择不回复客户端，直接断开
+        LOGW("[Companion] Failed to connect to proxy: %s", strerror(errno));
         close(target_fd);
         close(client_fd);
         return;
     }
-
-    // 3. 转发数据
     write(target_fd, buffer, len);
     LOGI("[Companion] Forwarded to Proxy: %s", buffer);
-
-    // 4. 清理
     close(target_fd);
     close(client_fd);
 }
 
 // -----------------------------------------------------------------------------
-// Module (客户端) 逻辑 - 运行在 APP 进程内
+// Module (客户端) 逻辑
 // -----------------------------------------------------------------------------
 
 class NamespaceProxyModule : public zygisk::ModuleBase {
@@ -83,69 +61,98 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        // [关键步骤 1] 在沙盒生效前，连接 Companion (Root 进程)
-        // 这个 fd 会被保留到 postAppSpecialize 使用
-        this->companion_fd = api->connectCompanion();
+        // [过滤第一步]：通过 UID 快速过滤掉核心系统服务
+        int app_id = args->uid % 100000;
+        if (app_id < 10000) {
+            return; // 是系统服务，不是应用，直接跳过
+        }
 
+        // [过滤第二步]：通过 ApplicationInfo.flags 过滤掉预装的系统应用
+        if (!isUserApp(args->nice_name)) {
+            // 是系统应用 (如相机、设置)，跳过
+            const char* pkg_name_c = env->GetStringUTFChars(args->nice_name, nullptr);
+            LOGD("[Module] Skipping system app: %s", pkg_name_c);
+            env->ReleaseStringUTFChars(args->nice_name, pkg_name_c);
+            return;
+        }
+
+        // 只有用户安装的应用才会执行到这里
+        this->companion_fd = api->connectCompanion();
         if (this->companion_fd < 0) {
             LOGE("[Module] Failed to connect to Companion!");
         }
 
-        // [隐藏] 
         api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
         api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        // 如果连接 Companion 失败，直接退出
-        if (this->companion_fd < 0) return;
+        if (this->companion_fd < 0) return; // 如果被过滤了，fd 为 -1，直接退出
 
-        // 1. 获取包名
-        const char* process_name = nullptr;
-        bool need_release = false;
+        const char* process_name = env->GetStringUTFChars(args->nice_name, nullptr);
+        LOGI("[Module] User App specialized: %s (UID: %d). Sending...", process_name, args->uid);
 
-        if (args->nice_name) {
-            process_name = env->GetStringUTFChars(args->nice_name, nullptr);
-            need_release = true;
-        }
-        if (process_name == nullptr) process_name = getprogname();
-        if (process_name == nullptr) process_name = "unknown";
-
-        // 2. 过滤系统进程
-        if (strstr(process_name, "zygote") != nullptr || 
-            strcmp(process_name, "app_process") == 0 || 
-            strcmp(process_name, "app_process64") == 0) {
-            
-            if (need_release && args->nice_name) env->ReleaseStringUTFChars(args->nice_name, process_name);
-            close(this->companion_fd); // 别忘了关闭 fd
-            return; 
-        }
-
-        LOGI("[Module] Process specialized: %s. Sending to companion...", process_name);
-
-        // 3. 格式化数据并通过 companion_fd 发送
         char buffer[256];
         int msg_len = snprintf(buffer, sizeof(buffer), "%s %d", process_name, getpid());
-        
         if (msg_len > 0) {
             write(this->companion_fd, buffer, msg_len);
         }
 
-        // 4. 清理资源
-        close(this->companion_fd); // 发送完即可关闭
-        if (need_release && args->nice_name) {
-            env->ReleaseStringUTFChars(args->nice_name, process_name);
-        }
+        close(this->companion_fd);
+        env->ReleaseStringUTFChars(args->nice_name, process_name);
     }
 
 private:
     zygisk::Api *api;
     JNIEnv *env;
-    int companion_fd; // 保存通往 Root 进程的文件描述符
+    int companion_fd;
+
+    // JNI 辅助函数，检查一个包名是否为用户应用
+    bool isUserApp(jstring packageName) {
+        if (packageName == nullptr) return false;
+
+        // 获取 ActivityThread -> Context -> PackageManager
+        jclass activityThreadClass = env->FindClass("android/app/ActivityThread");
+        if (!activityThreadClass) return false;
+        jmethodID currentActivityThreadMethod = env->GetStaticMethodID(activityThreadClass, "currentActivityThread", "()Landroid/app/ActivityThread;");
+        if (!currentActivityThreadMethod) return false;
+        jobject activityThread = env->CallStaticObjectMethod(activityThreadClass, currentActivityThreadMethod);
+        if (!activityThread) return false;
+        jmethodID getSystemContextMethod = env->GetMethodID(activityThreadClass, "getSystemContext", "()Landroid/content/Context;");
+        if (!getSystemContextMethod) return false;
+        jobject context = env->CallObjectMethod(activityThread, getSystemContextMethod);
+        if (!context) return false;
+        jclass contextClass = env->GetObjectClass(context);
+        jmethodID getPackageManagerMethod = env->GetMethodID(contextClass, "getPackageManager", "()Landroid/content/pm/PackageManager;");
+        if (!getPackageManagerMethod) return false;
+        jobject packageManager = env->CallObjectMethod(context, getPackageManagerMethod);
+        if (!packageManager) return false;
+
+        // 获取 ApplicationInfo
+        jclass packageManagerClass = env->GetObjectClass(packageManager);
+        jmethodID getApplicationInfoMethod = env->GetMethodID(packageManagerClass, "getApplicationInfo", "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;");
+        if (!getApplicationInfoMethod) return false;
+        jobject applicationInfo = env->CallObjectMethod(packageManager, getApplicationInfoMethod, packageName, 0 /* flags */);
+
+        if (env->ExceptionCheck() || !applicationInfo) {
+            env->ExceptionClear();
+            return false; // 获取失败，当作系统应用处理
+        }
+
+        // 获取 flags 字段
+        jclass applicationInfoClass = env->GetObjectClass(applicationInfo);
+        jfieldID flagsField = env->GetFieldID(applicationInfoClass, "flags", "I");
+        jint flags = env->GetIntField(applicationInfo, flagsField);
+
+        // 定义 FLAG_SYSTEM 和 FLAG_UPDATED_SYSTEM_APP 的值
+        // (直接用硬编码值比 JNI 查找静态字段更快更简单)
+        const int FLAG_SYSTEM = 1;
+        const int FLAG_UPDATED_SYSTEM_APP = 128;
+
+        // 如果 flags 中包含 FLAG_SYSTEM 或 FLAG_UPDATED_SYSTEM_APP，则为系统应用
+        return (flags & (FLAG_SYSTEM | FLAG_UPDATED_SYSTEM_APP)) == 0;
+    }
 };
 
-// 注册模块
 REGISTER_ZYGISK_MODULE(NamespaceProxyModule)
-
-// [关键步骤 2] 注册 Companion 处理函数
 REGISTER_ZYGISK_COMPANION(companion_handler)
