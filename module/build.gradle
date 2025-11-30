@@ -33,9 +33,6 @@ repositories {
 }
 
 androidComponents {
-    // *******************************************************************
-    // *** 核心修改：只对 release 构建类型应用自定义任务 ***
-    // *******************************************************************
     onVariants(selector().withBuildType("release")) { variant ->
         def variantCapped = variant.name.capitalize()
         def variantLowered = variant.name.toLowerCase()
@@ -44,11 +41,7 @@ androidComponents {
         def magiskDir = file("$outDir/magisk_module_$variantLowered")
 
         def prepareTask = tasks.register("prepareMagiskFiles${variantCapped}", Sync) {
-            // 移除这个显式依赖，因为 Artifacts API 会自动处理依赖关系
-            // dependsOn("assemble${variantCapped}")
-
             def templatePath = "$rootDir/template/magisk_module"
-
             into magiskDir
             from(templatePath) {
                 exclude 'module.prop'
@@ -95,13 +88,10 @@ androidComponents {
             archiveFileName.set(zipName)
             destinationDirectory.set(outDir)
         }
-        
-        // 现在可以安全地配置 assembleRelease 任务，因为它肯定存在
-        tasks.named("assemble${variantCapped}").configure {
-            it.finalizedBy(zipTask)
-        }
 
-        // adb 任务也只会为 release 创建
+        // *** 我们删除了 finalizedBy(zipTask) 的那段代码 ***
+        // 您的 adb 任务仍然可以正常工作，因为它们依赖于 zipTask
+
         def pushTask = tasks.register("push${variantCapped}", Exec) {
             dependsOn(zipTask)
             workingDir outDir
