@@ -7,7 +7,6 @@
 #include <cerrno>
 #include <cstdlib>
 #include <string>
-#include <vector>
 
 #include "zygisk.hpp"
 
@@ -20,13 +19,11 @@
 static const char* TARGET_SOCKET_PATH = "/data/Namespace-Proxy/ipc.sock";
 extern "C" const char* getprogname();
 
-// Companion (服务端) 逻辑 - 保持不变
+// Companion 逻辑 (不变)
 static void companion_handler(int client_fd) {
     char buffer[256] = {0};
     ssize_t len = read(client_fd, buffer, sizeof(buffer) - 1);
     if (len <= 0) { close(client_fd); return; }
-    
-    LOGD("[Companion] Received from App: %s", buffer);
 
     int target_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (target_fd < 0) { close(client_fd); return; }
@@ -37,19 +34,18 @@ static void companion_handler(int client_fd) {
     strncpy(addr.sun_path, TARGET_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
     if (connect(target_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        LOGW("[Companion] Failed to connect to proxy: %s", strerror(errno));
         close(target_fd);
         close(client_fd);
         return;
     }
     write(target_fd, buffer, len);
-    LOGI("[Companion] Forwarded to Proxy: %s", buffer);
+    LOGI("[Companion] Forwarded: %s", buffer);
     close(target_fd);
     close(client_fd);
 }
 
 // -----------------------------------------------------------------------------
-// Module (客户端) 逻辑
+// Module 逻辑
 // -----------------------------------------------------------------------------
 
 class NamespaceProxyModule : public zygisk::ModuleBase {
@@ -61,36 +57,35 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        // [过滤第一步]：通过 UID 快速过滤掉核心系统服务
+        // [Stage 1] 基础 UID 过滤
+        // 过滤掉 Root(0), System(1000), Shell(2000) 等核心进程
         int app_id = args->uid % 100000;
-        if (app_id < 10000) {
-            return; // 是系统服务，不是应用，直接跳过
-        }
+        if (app_id < 10000) return;
 
-        // [过滤第二步]：通过 ApplicationInfo.flags 过滤掉预装的系统应用
-        if (!isUserApp(args->nice_name)) {
-            // 是系统应用 (如相机、设置)，跳过
-            const char* pkg_name_c = env->GetStringUTFChars(args->nice_name, nullptr);
-            LOGD("[Module] Skipping system app: %s", pkg_name_c);
-            env->ReleaseStringUTFChars(args->nice_name, pkg_name_c);
-            return;
-        }
-
-        // 只有用户安装的应用才会执行到这里
+        // 预先连接 Companion，但不做复杂的应用类型判断
         this->companion_fd = api->connectCompanion();
-        if (this->companion_fd < 0) {
-            LOGE("[Module] Failed to connect to Companion!");
-        }
-
+        
+        // 隐藏模块
         api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
         api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        if (this->companion_fd < 0) return; // 如果被过滤了，fd 为 -1，直接退出
+        if (this->companion_fd < 0) return;
 
-        const char* process_name = env->GetStringUTFChars(args->nice_name, nullptr);
-        LOGI("[Module] User App specialized: %s (UID: %d). Sending...", process_name, args->uid);
+        // [Stage 2] 精确过滤：使用 Android API 判断是否为系统应用
+        // 此时 ART 环境已就绪，JNI 调用是安全的
+        if (!isUserApp(args->app_data_dir)) {
+            // 是系统应用，断开连接并退出
+            close(this->companion_fd);
+            return;
+        }
+
+        const char* process_name = nullptr;
+        if (args->nice_name) process_name = env->GetStringUTFChars(args->nice_name, nullptr);
+        if (!process_name) process_name = getprogname();
+
+        LOGI("[Module] User App Detected: %s (PID: %d)", process_name, getpid());
 
         char buffer[256];
         int msg_len = snprintf(buffer, sizeof(buffer), "%s %d", process_name, getpid());
@@ -99,7 +94,7 @@ public:
         }
 
         close(this->companion_fd);
-        env->ReleaseStringUTFChars(args->nice_name, process_name);
+        if (args->nice_name && process_name) env->ReleaseStringUTFChars(args->nice_name, process_name);
     }
 
 private:
@@ -107,50 +102,46 @@ private:
     JNIEnv *env;
     int companion_fd;
 
-    // JNI 辅助函数，检查一个包名是否为用户应用
-    bool isUserApp(jstring packageName) {
-        if (packageName == nullptr) return false;
-
-        // 获取 ActivityThread -> Context -> PackageManager
+    // -------------------------------------------------------------------------
+    // 准确判断是否为用户应用
+    // 策略：检查 ApplicationInfo.flags
+    // -------------------------------------------------------------------------
+    bool isUserApp(jstring appDataDir) {
+        // 1. 获取 ActivityThread
         jclass activityThreadClass = env->FindClass("android/app/ActivityThread");
-        if (!activityThreadClass) return false;
-        jmethodID currentActivityThreadMethod = env->GetStaticMethodID(activityThreadClass, "currentActivityThread", "()Landroid/app/ActivityThread;");
-        if (!currentActivityThreadMethod) return false;
-        jobject activityThread = env->CallStaticObjectMethod(activityThreadClass, currentActivityThreadMethod);
-        if (!activityThread) return false;
-        jmethodID getSystemContextMethod = env->GetMethodID(activityThreadClass, "getSystemContext", "()Landroid/content/Context;");
-        if (!getSystemContextMethod) return false;
-        jobject context = env->CallObjectMethod(activityThread, getSystemContextMethod);
-        if (!context) return false;
+        if (!activityThreadClass) { env->ExceptionClear(); return false; }
+
+        jmethodID currentActivityThread = env->GetStaticMethodID(activityThreadClass, "currentActivityThread", "()Landroid/app/ActivityThread;");
+        jobject at = env->CallStaticObjectMethod(activityThreadClass, currentActivityThread);
+        if (!at) { env->ExceptionClear(); return false; }
+
+        // 2. 获取 Application (Context)
+        jmethodID getApplication = env->GetMethodID(activityThreadClass, "getApplication", "()Landroid/app/Application;");
+        jobject context = env->CallObjectMethod(at, getApplication);
+        if (!context) { env->ExceptionClear(); return false; }
+
+        // 3. 获取 ApplicationInfo
         jclass contextClass = env->GetObjectClass(context);
-        jmethodID getPackageManagerMethod = env->GetMethodID(contextClass, "getPackageManager", "()Landroid/content/pm/PackageManager;");
-        if (!getPackageManagerMethod) return false;
-        jobject packageManager = env->CallObjectMethod(context, getPackageManagerMethod);
-        if (!packageManager) return false;
+        jmethodID getAppInfo = env->GetMethodID(contextClass, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
+        jobject appInfo = env->CallObjectMethod(context, getAppInfo);
+        if (!appInfo) { env->ExceptionClear(); return false; }
 
-        // 获取 ApplicationInfo
-        jclass packageManagerClass = env->GetObjectClass(packageManager);
-        jmethodID getApplicationInfoMethod = env->GetMethodID(packageManagerClass, "getApplicationInfo", "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;");
-        if (!getApplicationInfoMethod) return false;
-        jobject applicationInfo = env->CallObjectMethod(packageManager, getApplicationInfoMethod, packageName, 0 /* flags */);
+        // 4. 检查 flags
+        jclass appInfoClass = env->GetObjectClass(appInfo);
+        jfieldID flagsField = env->GetFieldID(appInfoClass, "flags", "I");
+        jint flags = env->GetIntField(appInfo, flagsField);
 
-        if (env->ExceptionCheck() || !applicationInfo) {
-            env->ExceptionClear();
-            return false; // 获取失败，当作系统应用处理
+        // FLAG_SYSTEM = 1
+        // FLAG_UPDATED_SYSTEM_APP = 128
+        bool isSystem = (flags & 1) != 0;
+        bool isUpdatedSystem = (flags & 128) != 0;
+
+        // 如果是 系统应用 或 升级后的系统应用，则返回 false (过滤掉)
+        if (isSystem || isUpdatedSystem) {
+            return false;
         }
 
-        // 获取 flags 字段
-        jclass applicationInfoClass = env->GetObjectClass(applicationInfo);
-        jfieldID flagsField = env->GetFieldID(applicationInfoClass, "flags", "I");
-        jint flags = env->GetIntField(applicationInfo, flagsField);
-
-        // 定义 FLAG_SYSTEM 和 FLAG_UPDATED_SYSTEM_APP 的值
-        // (直接用硬编码值比 JNI 查找静态字段更快更简单)
-        const int FLAG_SYSTEM = 1;
-        const int FLAG_UPDATED_SYSTEM_APP = 128;
-
-        // 如果 flags 中包含 FLAG_SYSTEM 或 FLAG_UPDATED_SYSTEM_APP，则为系统应用
-        return (flags & (FLAG_SYSTEM | FLAG_UPDATED_SYSTEM_APP)) == 0;
+        return true;
     }
 };
 
