@@ -1,21 +1,13 @@
-#include <android/log.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/time.h>
-#include <sys/stat.h>
 #include <unistd.h>
 #include <cstdio>
 #include <cstring>
-#include <cerrno>
 
 #include "zygisk.hpp"
 
-#define LOG_TAG "Zygisk_Blocker"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-
 static const char* TARGET_SOCKET_PATH = "/data/Namespace-Proxy/ipc.sock";
-static const char* LOCK_FILE_PATH = "/data/Namespace-Proxy/app.lock";
 
 extern "C" const char* getprogname();
 
@@ -28,12 +20,6 @@ static void companion_handler(int client_fd) {
     char buffer[256] = {0};
     if (read(client_fd, buffer, sizeof(buffer)) <= 0) {
         close(client_fd);
-        return;
-    }
-
-    // 检查锁文件
-    if (access(LOCK_FILE_PATH, F_OK) != 0) {
-        send_and_close("SKIP_NO_LOCK");
         return;
     }
 
@@ -75,7 +61,6 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        // 过滤 UID < 1001 的系统应用
         if (args->uid < 1001) {
             this->companion_fd = -1;
             return;
@@ -88,7 +73,6 @@ public:
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
         if (this->companion_fd < 0) return;
 
-        // 设置 1 秒超时强制放行
         struct timeval tv = {1, 0};
         setsockopt(this->companion_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
@@ -102,7 +86,6 @@ public:
         write(this->companion_fd, buffer, strlen(buffer));
 
         char signal[32] = {0};
-        // 阻塞直到信号返回或超时
         read(this->companion_fd, signal, sizeof(signal) - 1);
 
         if (args->nice_name && process_name) env->ReleaseStringUTFChars(args->nice_name, process_name);
