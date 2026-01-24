@@ -2,6 +2,7 @@
 #include <sys/un.h>
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <sys/uio.h> // 必须：用于控制信息
 #include <unistd.h>
 #include <cstdio>
 #include <cstring>
@@ -13,7 +14,7 @@
 #include <mutex>
 #include <thread>
 #include <android/log.h>
-#include <android/dlext.h> // 必须包含，用于从 FD 加载 SO
+#include <android/dlext.h>
 
 #include "zygisk.hpp"
 #include "shadowhook.h"
@@ -37,10 +38,57 @@ static void z_log(const char* fmt, ...) {
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "[%d][%s] %s", getpid(), g_process_name, msg);
 }
 
+static int send_fd(int socket, int fd) {
+    struct msghdr msg = {0};
+    char buf[1] = {0};
+    struct iovec io = {.iov_base = buf, .iov_len = 1};
+    msg.msg_iov = &io;
+    msg.msg_iovlen = 1;
+
+    union {
+        struct cmsghdr cm;
+        char control[CMSG_SPACE(sizeof(int))];
+    } control_un;
+    msg.msg_control = control_un.control;
+    msg.msg_controllen = sizeof(control_un.control);
+
+    struct cmsghdr *cmptr = CMSG_FIRSTHDR(&msg);
+    cmptr->cmsg_len = CMSG_LEN(sizeof(int));
+    cmptr->cmsg_level = SOL_SOCKET;
+    cmptr->cmsg_type = SCM_RIGHTS;
+    *((int *)CMSG_DATA(cmptr)) = fd;
+
+    return sendmsg(socket, &msg, 0);
+}
+
+static int recv_fd(int socket) {
+    struct msghdr msg = {0};
+    char buf[1];
+    struct iovec io = {.iov_base = buf, .iov_len = 1};
+    msg.msg_iov = &io;
+    msg.msg_iovlen = 1;
+
+    union {
+        struct cmsghdr cm;
+        char control[CMSG_SPACE(sizeof(int))];
+    } control_un;
+    msg.msg_control = control_un.control;
+    msg.msg_controllen = sizeof(control_un.control);
+
+    if (recvmsg(socket, &msg, 0) <= 0) return -1;
+
+    struct cmsghdr *cmptr = CMSG_FIRSTHDR(&msg);
+    if (cmptr && cmptr->cmsg_len == CMSG_LEN(sizeof(int))) {
+        if (cmptr->cmsg_level == SOL_SOCKET && cmptr->cmsg_type == SCM_RIGHTS) {
+            return *((int *)CMSG_DATA(cmptr));
+        }
+    }
+    return -1;
+}
+
 // --- 路径判定逻辑 ---
 static bool is_path_blocked(const char* path) {
     if (!path) return false;
-    // 硬编码拦截规则：1DMP
     if (strstr(path, "/storage/emulated/0/Download/1DMP")) return true;
 
     std::lock_guard<std::mutex> lock(g_rule_mutex);
@@ -71,39 +119,30 @@ int my_mkdirat(int fd, const char* path, mode_t mode) {
     return ((mkdirat_t)orig_mkdirat)(fd, path, mode);
 }
 
-// --- 核心：通过 FD 强制加载 ShadowHook ---
+// --- 核心逻辑：从 FD 加载 ShadowHook ---
 static bool install_hooks_via_fd() {
     static bool hooks_installed = false;
     if (hooks_installed) return true;
 
-    z_log("通过 Companion 获取 FD 并强行加载 ShadowHook...");
-
     int client_fd = g_api->connectCompanion();
-    if (client_fd < 0) {
-        z_log("错误: 无法连接 Companion");
-        return false;
-    }
+    if (client_fd < 0) return false;
 
-    // 指令：我要 ShadowHook 的 FD
-    const char* cmd = "GET_SH_FD";
-    write(client_fd, cmd, strlen(cmd) + 1);
-
-    // 接收从 Root 进程传过来的 FD
-    int sh_fd = g_api->recvFd(client_fd);
+    write(client_fd, "GET_SH_FD", 10);
+    int sh_fd = recv_fd(client_fd); // 使用我们的静态函数
     close(client_fd);
 
     if (sh_fd < 0) {
-        z_log("错误: 未收到合法的 FD");
+        z_log("错误: 无法从 Companion 获取 FD");
         return false;
     }
 
-    // 使用 android_dlopen_ext 从 FD 直接加载，无视路径权限
     android_dlextinfo extinfo;
     extinfo.flags = ANDROID_DLEXT_USE_LIBRARY_FD;
     extinfo.library_fd = sh_fd;
 
+    // 从 FD 加载，避开路径权限检查
     void* handle = android_dlopen_ext("libshadowhook.so", RTLD_NOW, &extinfo);
-    close(sh_fd); // 加载后即可关闭 FD
+    close(sh_fd);
 
     if (!handle) {
         z_log("错误: android_dlopen_ext 失败: %s", dlerror());
@@ -114,7 +153,7 @@ static bool install_hooks_via_fd() {
     auto sh_hook = (void* (*)(const char*, const char*, void*, void**))dlsym(handle, "shadowhook_hook_sym_name");
 
     if (!sh_init || !sh_hook || sh_init(SHADOWHOOK_MODE_UNIQUE, false) != 0) {
-        z_log("错误: ShadowHook 初始化失败");
+        z_log("错误: ShadowHook 初始化或符号查找失败");
         return false;
     }
 
@@ -122,20 +161,20 @@ static bool install_hooks_via_fd() {
     orig_mkdirat = sh_hook("libc.so", "mkdirat", (void*)my_mkdirat, nullptr);
 
     if (orig_openat && orig_mkdirat) {
-        z_log("成功: 绕过 SELinux 完成系统 Hook");
+        z_log("成功: 已通过 FD 绕过 SELinux 完成 Hook");
         hooks_installed = true;
         return true;
     }
     return false;
 }
 
-// --- 后台通信线程 (用于上报和动态规则) ---
+// --- 通信保持线程 ---
 static void connection_keeper_thread() {
     while (true) {
         int fd = g_api->connectCompanion();
         if (fd < 0) { sleep(5); continue; }
         
-        write(fd, "PROXY_CONNECT", 13); // 告知 Companion 转发至 Injector
+        write(fd, "PROXY_CONNECT", 14);
         
         char report[256];
         snprintf(report, sizeof(report), "REPORT %s %d STATUS:OK", g_process_name, getpid());
@@ -156,7 +195,7 @@ static void connection_keeper_thread() {
                     token = strtok(nullptr, ",");
                 }
                 free(data);
-                z_log("动态规则已同步");
+                z_log("动态规则已更新");
             }
         }
         close(fd);
@@ -164,14 +203,13 @@ static void connection_keeper_thread() {
     }
 }
 
-// --- Companion Handler (运行在 Root 权限) ---
+// --- Companion 处理 ---
 static void companion_handler(int client_fd) {
     char buf[64];
     ssize_t n = read(client_fd, buf, sizeof(buf));
     if (n <= 0) { close(client_fd); return; }
 
     if (strcmp(buf, "GET_SH_FD") == 0) {
-        // Root 侧负责寻找并打开文件
 #ifdef __aarch64__
         const char* path = "/data/adb/modules/Namespace-Proxy/lib/arm64-v8a/libshadowhook.so";
 #else
@@ -179,15 +217,20 @@ static void companion_handler(int client_fd) {
 #endif
         int fd = open(path, O_RDONLY | O_CLOEXEC);
         if (fd >= 0) {
-            g_api->sendFd(client_fd, fd);
+            send_fd(client_fd, fd); // 使用我们的静态函数
             close(fd);
         } else {
-            g_api->sendFd(client_fd, -1);
+            // 发送一个无效标志
+            struct msghdr msg = {0};
+            char dummy[1] = {0};
+            struct iovec io = {.iov_base = dummy, .iov_len = 1};
+            msg.msg_iov = &io;
+            msg.msg_iovlen = 1;
+            sendmsg(client_fd, &msg, 0);
         }
         close(client_fd);
     } 
     else if (strcmp(buf, "PROXY_CONNECT") == 0) {
-        // 传统的转发逻辑
         int target_fd = socket(AF_UNIX, SOCK_STREAM, 0);
         struct sockaddr_un addr{.sun_family = AF_UNIX};
         strncpy(addr.sun_path, TARGET_SOCKET_PATH, sizeof(addr.sun_path)-1);
@@ -220,10 +263,8 @@ public:
     }
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
         if (!g_is_media_process) { g_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY); return; }
-        // 自动注入
         install_hooks_via_fd();
         std::thread(connection_keeper_thread).detach();
-        z_log("媒体注入已就绪 (FD 模式)");
     }
 private:
     JNIEnv *env;
