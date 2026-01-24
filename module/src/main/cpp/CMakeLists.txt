@@ -26,8 +26,7 @@ add_library(${MODULE_NAME} SHARED main.cpp)
 # 关键：链接 shadowhook_static (静态库版本)
 # 注意：Prefab 默认可能只提供 shadowhook::shadowhook，它会自动根据依赖选择
 target_link_libraries(${MODULE_NAME}
-    log 
-    android
+    log
 )
 
 # 强制剥离所有符号
