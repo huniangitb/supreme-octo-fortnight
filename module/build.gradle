@@ -10,37 +10,40 @@ android {
     defaultConfig {
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        // 限制架构，ShadowHook 不支持 x86
+        // 限制架构，因为我们的代码只处理 ARM
         ndk {
             abiFilters 'arm64-v8a', 'armeabi-v7a'
         }
         externalNativeBuild {
             cmake {
+                // 向 CMake 传递模块名
                 arguments "-DMODULE_NAME:STRING=$moduleLibraryName", "-DCMAKE_EXPORT_COMPILE_COMMANDS:STRING=ON"
                 abiFilters 'arm64-v8a', 'armeabi-v7a'
             }
         }
     }
-    buildFeatures {
-        prefab true
-    }
+    // 【已移除】不再需要 prefab 功能，因为它用于编译时链接
+    // buildFeatures {
+    //     prefab true
+    // }
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
             version "3.22.1"
         }
     }
+    // 【已保留】这个修复了 AndroidManifest.xml 的警告
     namespace 'aknoryx.zygisktz'
 }
 
-repositories {
-    mavenCentral()
-    mavenLocal()
-}
-
-dependencies {
-    implementation 'com.bytedance.android:shadowhook:2.0.0'
-}
+// 【已移除】我们不需要任何编译时依赖，特别是 ShadowHook
+// repositories {
+//     mavenCentral()
+//     mavenLocal()
+// }
+// dependencies {
+//     implementation 'com.bytedance.android:shadowhook:2.0.0'
+// }
 
 afterEvaluate {
     android.libraryVariants.forEach { variant ->
@@ -48,7 +51,7 @@ afterEvaluate {
         def variantLowered = variant.name.toLowerCase()
 
         def zipName = "${magiskModuleId.replace('_', '-')}-${moduleVersion}-${variantLowered}.zip"
-        def magiskDir = file("$outDir/magisk_module_$variantLowered")
+        def magiskDir = file("$buildDir/magisk_module_$variantLowered") // 使用 buildDir 保证输出目录干净
 
         task("prepareMagiskFiles${variantCapped}", type: Sync) {
             dependsOn("assemble$variantCapped")
@@ -73,6 +76,8 @@ afterEvaluate {
                         eol: FixCrLfFilter.CrLf.newInstance("lf"))
             }
 
+            // 【已保留】这个 doLast 块的语法是正确的
+            // 它会在文件同步任务完成后，执行外部的 shell 脚本来复制 so 文件
             doLast {
                 exec {
                     workingDir project.projectDir
@@ -85,12 +90,12 @@ afterEvaluate {
             dependsOn("prepareMagiskFiles${variantCapped}")
             from magiskDir
             archiveFileName.set(zipName)
-            destinationDirectory.set(outDir)
+            destinationDirectory.set(file("$buildDir/outputs/magisk")) // 统一输出到 build/outputs/magisk
         }
 
         task("push${variantCapped}", type: Exec) {
             dependsOn("zip${variantCapped}")
-            workingDir outDir
+            workingDir file("$buildDir/outputs/magisk")
             commandLine android.adbExecutable, "push", zipName, "/data/local/tmp/"
         }
 
