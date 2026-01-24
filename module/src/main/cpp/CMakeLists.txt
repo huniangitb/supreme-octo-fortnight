@@ -11,18 +11,15 @@ endif ()
 # 设置 C++ 标准
 set(CMAKE_CXX_STANDARD 20)
 
-# ------------------------------------------------------------------
-#  移除所有和 find_package 以及 shadowhook 相关的链接指令
-#  我们不需要编译时链接，因为代码里用了 dlopen
-# ------------------------------------------------------------------
-
 # 添加你的模块库，源文件是 main.cpp
-# 假设你的模块名叫 ${MODULE_NAME}，这是由 Zygisk 模板定义的
+# ${MODULE_NAME} 变量由 Zygisk 模板的 build.gradle 传入
 add_library(${MODULE_NAME} SHARED main.cpp)
 
 # 只链接 Android 日志库，这是我们唯一需要的外部库
 find_library(log-lib log)
-target_link_libraries(${MODULE_-NAME} ${log-lib})
+# 【已修正】确保变量名是 ${MODULE_NAME}，没有多余的字符
+target_link_libraries(${MODULE_NAME} ${log-lib})
+
 
 # ----------------- 可选：保留你的优化选项 -----------------
 # 这些优化选项对于 Zygisk 模块来说是很好的，可以保留
