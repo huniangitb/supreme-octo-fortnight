@@ -20,6 +20,7 @@ static int g_companion_fd = -1;
 
 extern "C" const char* getprogname();
 
+// 路径过滤：仅针对媒体路径
 static bool is_media_blocked(const char* path) {
     if (!path) return false;
     if (strncmp(path, "/storage/", 9) != 0 && strncmp(path, "/sdcard", 7) != 0) return false;
@@ -34,7 +35,7 @@ static bool is_media_blocked(const char* path) {
 typedef int (*openat_t)(int, const char*, int, mode_t);
 static void* orig_openat = nullptr;
 int my_openat(int fd, const char* path, int flags, mode_t mode) {
-    if (is_media_blocked(path)) return -1; 
+    if (is_media_blocked(path)) return -1;
     return ((openat_t)orig_openat)(fd, path, flags, mode);
 }
 
@@ -81,13 +82,19 @@ static void companion_handler(int client_fd) {
 
     if (connect(target_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         close(target_fd);
-        write(client_fd, "ERR_CONN", 8);
+        write(client_fd, "SKIP", 4); // 连接后端失败默认放行
         close(client_fd);
         return;
     }
 
     write(target_fd, buffer, strlen(buffer));
 
+    // 同步等待后端返回：ENABLE_HOOK 或 OK
+    char resp[64] = {0};
+    ssize_t len = read(target_fd, resp, sizeof(resp) - 1);
+    if (len > 0) write(client_fd, resp, (size_t)len);
+
+    // 建立双向转发维持规则更新通道
     std::thread([client_fd, target_fd]() {
         char b[1024];
         while (true) {
@@ -100,7 +107,7 @@ static void companion_handler(int client_fd) {
     }).detach();
 }
 
-class MediaBlockModule : public zygisk::ModuleBase {
+class TargetedBlockerModule : public zygisk::ModuleBase {
 public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
         this->api = api;
@@ -119,22 +126,38 @@ public:
         if (this->companion_fd < 0) return;
         g_companion_fd = this->companion_fd;
 
-        shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false);
-        // 修正函数名：shadowhook_hook_sym_name
-        orig_openat = shadowhook_hook_sym_name("libc.so", "openat", (void*)my_openat, nullptr);
-        orig_mkdirat = shadowhook_hook_sym_name("libc.so", "mkdirat", (void*)my_mkdirat, nullptr);
-
         const char* process_name = nullptr;
         if (args->nice_name) process_name = env->GetStringUTFChars(args->nice_name, nullptr);
         if (!process_name) process_name = getprogname();
 
+        // 汇报进程信息
         char buffer[256];
-        snprintf(buffer, sizeof(buffer), "INIT %s %d", process_name ? process_name : "unknown", getpid());
+        snprintf(buffer, sizeof(buffer), "REPORT %s %d", process_name ? process_name : "unknown", getpid());
         write(g_companion_fd, buffer, strlen(buffer));
 
         if (args->nice_name && process_name) env->ReleaseStringUTFChars(args->nice_name, process_name);
 
-        std::thread(rule_listener).detach();
+        // 等待命令决定是否开启 Hook
+        char cmd[64] = {0};
+        struct timeval tv = {0, 500000}; // 0.5秒等待
+        setsockopt(g_companion_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        
+        ssize_t len = read(g_companion_fd, cmd, sizeof(cmd) - 1);
+        
+        if (len > 0 && strncmp(cmd, "ENABLE_HOOK", 11) == 0) {
+            // 需要 Hook，则不设置 DLCLOSE 选项，保持动态库驻留
+            shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false);
+            orig_openat = shadowhook_hook_sym_name("libc.so", "openat", (void*)my_openat, nullptr);
+            orig_mkdirat = shadowhook_hook_sym_name("libc.so", "mkdirat", (void*)my_mkdirat, nullptr);
+            
+            // 开启监听线程实时更新拦截规则
+            std::thread(rule_listener).detach();
+        } else {
+            // 普通应用，卸载模块代码以节省资源并消除特征
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            close(g_companion_fd);
+            g_companion_fd = -1;
+        }
     }
 
 private:
@@ -143,5 +166,5 @@ private:
     int companion_fd;
 };
 
-REGISTER_ZYGISK_MODULE(MediaBlockModule)
+REGISTER_ZYGISK_MODULE(TargetedBlockerModule)
 REGISTER_ZYGISK_COMPANION(companion_handler)
