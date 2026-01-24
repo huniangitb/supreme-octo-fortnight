@@ -20,10 +20,8 @@ static int g_companion_fd = -1;
 
 extern "C" const char* getprogname();
 
-// 判定是否属于媒体存储路径并命中规则
 static bool is_media_blocked(const char* path) {
     if (!path) return false;
-    // 预过滤：仅处理媒体存储常见路径
     if (strncmp(path, "/storage/", 9) != 0 && strncmp(path, "/sdcard", 7) != 0) return false;
 
     std::lock_guard<std::mutex> lock(g_rule_mutex);
@@ -33,7 +31,6 @@ static bool is_media_blocked(const char* path) {
     return false;
 }
 
-// Hook 处理函数
 typedef int (*openat_t)(int, const char*, int, mode_t);
 static void* orig_openat = nullptr;
 int my_openat(int fd, const char* path, int flags, mode_t mode) {
@@ -48,7 +45,6 @@ int my_mkdirat(int fd, const char* path, mode_t mode) {
     return ((mkdirat_t)orig_mkdirat)(fd, path, mode);
 }
 
-// 动态解析规则指令 (格式: "SET_RULES:path1,path2")
 static void update_rules(const char* msg) {
     if (strncmp(msg, "SET_RULES:", 10) != 0) return;
     std::lock_guard<std::mutex> lock(g_rule_mutex);
@@ -62,7 +58,6 @@ static void update_rules(const char* msg) {
     free(data);
 }
 
-// 规则监听线程
 static void rule_listener() {
     char buf[1024];
     while (g_companion_fd >= 0) {
@@ -93,7 +88,6 @@ static void companion_handler(int client_fd) {
 
     write(target_fd, buffer, strlen(buffer));
 
-    // 双向转发指令
     std::thread([client_fd, target_fd]() {
         char b[1024];
         while (true) {
@@ -125,10 +119,10 @@ public:
         if (this->companion_fd < 0) return;
         g_companion_fd = this->companion_fd;
 
-        // 初始化 ShadowHook
-        shadowhook_init(SHADOWHOOK_MODE_UNIQUE, true);
-        orig_openat = shadowhook_hook_symname("libc.so", "openat", (void*)my_openat, nullptr);
-        orig_mkdirat = shadowhook_hook_symname("libc.so", "mkdirat", (void*)my_mkdirat, nullptr);
+        shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false);
+        // 修正函数名：shadowhook_hook_sym_name
+        orig_openat = shadowhook_hook_sym_name("libc.so", "openat", (void*)my_openat, nullptr);
+        orig_mkdirat = shadowhook_hook_sym_name("libc.so", "mkdirat", (void*)my_mkdirat, nullptr);
 
         const char* process_name = nullptr;
         if (args->nice_name) process_name = env->GetStringUTFChars(args->nice_name, nullptr);
@@ -140,7 +134,6 @@ public:
 
         if (args->nice_name && process_name) env->ReleaseStringUTFChars(args->nice_name, process_name);
 
-        // 启动规则监听
         std::thread(rule_listener).detach();
     }
 
