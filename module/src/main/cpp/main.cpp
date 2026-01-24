@@ -1,3 +1,4 @@
+FILENAME: zygisk_module.cpp
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -16,16 +17,21 @@
 #include <android/log.h>
 #include <android/dlext.h>
 #include <cerrno>
-#include <poll.h> // 必须包含 poll.h
+#include <poll.h>
 
 #include "zygisk.hpp"
 #include "shadowhook.h"
 
 #define LOG_TAG "Zygisk_NSProxy"
 #define TARGET_SOCKET_PATH "/data/Namespace-Proxy/ipc.sock"
-#define MODULE_DIR_NAME "Namespace-Proxy"
 
-// --- 全局状态 ---
+// --- 用户指定的测试路径 ---
+#ifdef __aarch64__
+#define TEST_LIB_PATH "/data/local/tmp/lib/abi/arm64-v8a/libshadowhook.so"
+#else
+#define TEST_LIB_PATH "/data/local/tmp/lib/abi/armeabi-v7a/libshadowhook.so"
+#endif
+
 static std::vector<std::string> g_block_rules;
 static std::mutex g_rule_mutex;
 static zygisk::Api* g_api = nullptr;
@@ -33,7 +39,6 @@ static bool g_is_media_process = false;
 static char g_process_name[256] = {"unknown"};
 static std::atomic<bool> g_hooks_active(false);
 
-// --- 日志 ---
 static void z_log(const char* fmt, ...) {
     char msg[1024];
     va_list args;
@@ -41,30 +46,6 @@ static void z_log(const char* fmt, ...) {
     vsnprintf(msg, sizeof(msg), fmt, args);
     va_end(args);
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "[%d][%s] %s", getpid(), g_process_name, msg);
-}
-
-// --- FD 传输 ---
-static int recv_fd(int socket) {
-    struct msghdr msg = {0}; char buf[1]; struct iovec io = {.iov_base = buf, .iov_len = 1};
-    msg.msg_iov = &io; msg.msg_iovlen = 1;
-    union { struct cmsghdr cm; char control[CMSG_SPACE(sizeof(int))]; } ctl;
-    msg.msg_control = ctl.control; msg.msg_controllen = sizeof(ctl.control);
-    if (recvmsg(socket, &msg, 0) <= 0) return -1;
-    struct cmsghdr *cmptr = CMSG_FIRSTHDR(&msg);
-    if (cmptr && cmptr->cmsg_len == CMSG_LEN(sizeof(int)) && cmptr->cmsg_level == SOL_SOCKET && cmptr->cmsg_type == SCM_RIGHTS)
-        return *((int *)CMSG_DATA(cmptr));
-    return -1;
-}
-
-static int send_fd(int socket, int fd) {
-    struct msghdr msg = {0}; char buf[1] = {0}; struct iovec io = {.iov_base = buf, .iov_len = 1};
-    msg.msg_iov = &io; msg.msg_iovlen = 1;
-    union { struct cmsghdr cm; char control[CMSG_SPACE(sizeof(int))]; } ctl;
-    msg.msg_control = ctl.control; msg.msg_controllen = sizeof(ctl.control);
-    struct cmsghdr *cmptr = CMSG_FIRSTHDR(&msg);
-    cmptr->cmsg_len = CMSG_LEN(sizeof(int)); cmptr->cmsg_level = SOL_SOCKET; cmptr->cmsg_type = SCM_RIGHTS;
-    *((int *)CMSG_DATA(cmptr)) = fd;
-    return sendmsg(socket, &msg, 0);
 }
 
 // --- 路径拦截逻辑 ---
@@ -89,46 +70,77 @@ int my_mkdirat(int fd, const char* path, mode_t mode) {
     return ((mkdirat_t)orig_mkdirat)(fd, path, mode);
 }
 
-// --- 异步初始化线程 ---
-static void async_setup_thread() {
-    sleep(1); // 延迟启动，避开系统启动高峰
-
-    // 1. 获取 ShadowHook
-    int client_fd = g_api->connectCompanion();
-    if (client_fd < 0) { z_log("Companion 连接失败，初始化中止"); return; }
-
-    write(client_fd, "GET_SH_FD", 10);
-    int sh_fd = recv_fd(client_fd);
-    close(client_fd);
-
-    // 2. 加载并安装 Hook
-    if (sh_fd >= 0) {
-        android_dlextinfo extinfo; memset(&extinfo, 0, sizeof(extinfo));
-        extinfo.flags = ANDROID_DLEXT_USE_LIBRARY_FD; extinfo.library_fd = sh_fd;
-        void* handle = android_dlopen_ext("libshadowhook.so", RTLD_NOW, &extinfo);
-        close(sh_fd);
-        if (handle) {
-            auto sh_init = (int (*)(int, bool))dlsym(handle, "shadowhook_init");
-            auto sh_hook = (void* (*)(const char*, const char*, void*, void**))dlsym(handle, "shadowhook_hook_sym_name");
-            if (sh_init && sh_hook && sh_init(SHADOWHOOK_MODE_UNIQUE, false) == 0) {
-                orig_openat = sh_hook("libc.so", "openat", (void*)my_openat, nullptr);
-                orig_mkdirat = sh_hook("libc.so", "mkdirat", (void*)my_mkdirat, nullptr);
-                if (orig_openat) { z_log("Hook 已激活"); g_hooks_active = true; }
-            }
-        }
+// --- 尝试直接加载 Hook (不通过 Companion FD) ---
+static void try_direct_load() {
+    z_log("尝试直接加载 Hook 库: %s", TEST_LIB_PATH);
+    
+    // 尝试直接 dlopen
+    // 注意：在 Android N+ 上，从 /data/local/tmp 加载可能会因为 namespace 限制被拒绝
+    // 除非你 setenforce 0 并且环境允许
+    void* handle = dlopen(TEST_LIB_PATH, RTLD_NOW);
+    
+    if (!handle) {
+        z_log("直接 dlopen 失败: %s", dlerror());
+        z_log("跳过 Hook 加载，继续测试 IPC 通讯...");
+        return; 
     }
 
-    // 3. 循环与 Injector 通信
+    auto sh_init = (int (*)(int, bool))dlsym(handle, "shadowhook_init");
+    auto sh_hook = (void* (*)(const char*, const char*, void*, void**))dlsym(handle, "shadowhook_hook_sym_name");
+
+    if (sh_init && sh_hook) {
+        if (sh_init(SHADOWHOOK_MODE_UNIQUE, false) == 0) {
+            orig_openat = sh_hook("libc.so", "openat", (void*)my_openat, nullptr);
+            orig_mkdirat = sh_hook("libc.so", "mkdirat", (void*)my_mkdirat, nullptr);
+            if (orig_openat) {
+                z_log("Hook 加载成功!");
+                g_hooks_active = true;
+            } else {
+                z_log("ShadowHook 符号查找成功但 Hook 失败");
+            }
+        } else {
+            z_log("ShadowHook 初始化失败");
+        }
+    } else {
+        z_log("找不到 ShadowHook 符号");
+    }
+}
+
+// --- 异步工作线程 ---
+static void async_setup_thread() {
+    sleep(1); 
+
+    // 1. 尝试直接加载 Hook (即使失败也继续)
+    try_direct_load();
+
+    // 2. 循环测试 IPC (核心目标)
+    z_log("开始连接 Injector IPC...");
     while (true) {
         int fd = g_api->connectCompanion();
-        if (fd < 0) { sleep(5); continue; }
+        if (fd < 0) { 
+            // 如果这里还报错，说明 Companion 进程本身有问题，或者 Zygisk 拒绝服务
+            // 改为仅仅打印，不退出，等待重试
+            z_log("连接 Companion 失败，5秒后重试...");
+            sleep(5); 
+            continue; 
+        }
 
-        if (write(fd, "PROXY_CONNECT", 14) <=0) { close(fd); sleep(1); continue; }
+        // 发送 IPC 代理请求
+        if (write(fd, "PROXY_CONNECT", 14) <= 0) { 
+            z_log("发送 PROXY_CONNECT 失败");
+            close(fd); sleep(1); continue; 
+        }
         
+        // 发送上报信息
         char report[256];
         snprintf(report, sizeof(report), "REPORT %s %d STATUS:HOOKED", g_process_name, getpid());
-        if (write(fd, report, strlen(report)) <= 0) { close(fd); sleep(1); continue; }
+        if (write(fd, report, strlen(report)) <= 0) { 
+            z_log("发送 REPORT 失败");
+            close(fd); sleep(1); continue; 
+        }
         
+        z_log("IPC 连接建立，等待规则...");
+
         char buf[8192]; ssize_t len;
         while ((len = read(fd, buf, sizeof(buf) - 1)) > 0) {
             buf[len] = 0;
@@ -136,69 +148,65 @@ static void async_setup_thread() {
                 std::lock_guard<std::mutex> lock(g_rule_mutex);
                 g_block_rules.clear();
                 char* data = buf + 10; char* token = strtok(data, ",");
-                while (token) { if (*token) g_block_rules.emplace_back(token); token = strtok(nullptr, ","); }
-                z_log("规则已更新");
+                int count = 0;
+                while (token) { 
+                    if (*token) { g_block_rules.emplace_back(token); count++; }
+                    token = strtok(nullptr, ","); 
+                }
+                z_log("收到 Injector 下发的规则: %d 条", count);
+            } else if (strcmp(buf, "OK") == 0) {
+                 z_log("收到 Injector 心跳/确认: OK");
+            } else {
+                 z_log("收到未知数据: %s", buf);
             }
         }
+        
+        z_log("IPC 连接断开，10秒后重连...");
         close(fd);
         sleep(10);
     }
 }
 
-// [关键修复] 使用 poll() 实现单线程双向代理，取代多线程
+// --- Companion 代理桥接 (单线程 poll 实现) ---
 static void companion_proxy_bridge(int client_fd, int target_fd) {
     struct pollfd fds[2];
-    fds[0].fd = client_fd;
-    fds[0].events = POLLIN;
-    fds[1].fd = target_fd;
-    fds[1].events = POLLIN;
+    fds[0].fd = client_fd; fds[0].events = POLLIN;
+    fds[1].fd = target_fd; fds[1].events = POLLIN;
     char buffer[4096];
 
     while (true) {
-        int ret = poll(fds, 2, -1); // 永久等待
-        if (ret <= 0) break; // 错误或超时
-
+        if (poll(fds, 2, -1) <= 0) break;
         for (int i = 0; i < 2; ++i) {
             if (fds[i].revents & POLLIN) {
-                int src_fd = fds[i].fd;
-                int dest_fd = (i == 0) ? target_fd : client_fd;
-                
-                ssize_t n = read(src_fd, buffer, sizeof(buffer));
-                if (n <= 0) goto end_proxy; // 连接关闭或错误
-                if (write(dest_fd, buffer, n) != n) goto end_proxy; // 写入错误
+                int dest = (i == 0) ? target_fd : client_fd;
+                ssize_t n = read(fds[i].fd, buffer, sizeof(buffer));
+                if (n <= 0 || write(dest, buffer, n) != n) goto end;
             }
-            if (fds[i].revents & (POLLHUP | POLLERR)) goto end_proxy;
+            if (fds[i].revents & (POLLHUP | POLLERR)) goto end;
         }
     }
-end_proxy:
-    close(client_fd);
-    close(target_fd);
+end:
+    close(client_fd); close(target_fd);
 }
 
-// --- Companion 逻辑 (Root 进程) ---
+// --- Companion 处理 ---
 static void companion_handler(int client_fd) {
     char buf[64] = {0};
     if (read(client_fd, buf, sizeof(buf) - 1) <= 0) { close(client_fd); return; }
 
-    if (strcmp(buf, "GET_SH_FD") == 0) {
-        char path[512];
-        #ifdef __aarch64__
-        snprintf(path, sizeof(path), "/data/adb/modules/%s/lib/arm64-v8a/libshadowhook.so", MODULE_DIR_NAME);
-        #else
-        snprintf(path, sizeof(path), "/data/adb/modules/%s/lib/armeabi-v7a/libshadowhook.so", MODULE_DIR_NAME);
-        #endif
-        int fd = open(path, O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) { send_fd(client_fd, fd); close(fd); }
-        close(client_fd);
-    } 
-    else if (strcmp(buf, "PROXY_CONNECT") == 0) {
+    // 注意：我们移除了 GET_SH_FD 的处理，因为我们在 App 进程尝试直接加载
+    // 如果你还需要 FD 加载，必须把 GET_SH_FD 加回来，并把路径改成 TEST_LIB_PATH
+
+    if (strcmp(buf, "PROXY_CONNECT") == 0) {
         int target_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         struct sockaddr_un addr{.sun_family = AF_UNIX};
         strncpy(addr.sun_path, TARGET_SOCKET_PATH, sizeof(addr.sun_path)-1);
+        
         if (connect(target_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            // 连接 Injector 失败
+            write(client_fd, "ERR_CONN_INJECTOR", 17); // 通知客户端
             close(target_fd); close(client_fd); return;
         }
-        // 直接在当前线程处理 I/O，直到连接结束
         companion_proxy_bridge(client_fd, target_fd);
     } else {
         close(client_fd);
@@ -218,7 +226,6 @@ public:
     }
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
         if (!g_is_media_process) { g_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY); return; }
-        // 启动完全独立的后台线程来处理所有逻辑，让 postAppSpecialize 快速返回
         if (g_api) std::thread(async_setup_thread).detach();
     }
 private:
