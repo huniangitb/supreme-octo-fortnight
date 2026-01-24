@@ -21,7 +21,8 @@
 #define TARGET_SOCKET_PATH "/data/Namespace-Proxy/ipc.sock"
 
 // --- 全局变量 ---
-static std.vector<std::string> g_block_rules;
+// 【已修正】将 std.vector 改为 std::vector
+static std::vector<std::string> g_block_rules;
 static std::mutex g_rule_mutex;
 static zygisk::Api* g_api = nullptr;
 static bool g_is_media_process = false;
@@ -92,7 +93,6 @@ static bool install_hooks() {
         return false;
     }
 
-    // dlsym shadowhook_init
     auto sh_init = (int (*)(int, bool))dlsym(handle, "shadowhook_init");
     if (!sh_init || sh_init(SHADOWHOOK_MODE_UNIQUE, false) != 0) {
         z_log("错误: shadowhook_init 失败");
@@ -100,8 +100,6 @@ static bool install_hooks() {
         return false;
     }
 
-    // 【关键修复】
-    // dlsym shadowhook_hook_sym_name，以避免链接器错误
     typedef void* (*sh_hook_sym_name_t)(const char*, const char*, void*, void**);
     auto sh_hook_sym_name = (sh_hook_sym_name_t)dlsym(handle, "shadowhook_hook_sym_name");
     if (!sh_hook_sym_name) {
@@ -110,18 +108,15 @@ static bool install_hooks() {
         return false;
     }
 
-    // 通过函数指针调用 Hook
     orig_openat = sh_hook_sym_name("libc.so", "openat", (void*)my_openat, nullptr);
     orig_mkdirat = sh_hook_sym_name("libc.so", "mkdirat", (void*)my_mkdirat, nullptr);
 
     if (orig_openat && orig_mkdirat) {
         z_log("成功: 系统 Hook 已自动安装 (openat/mkdirat)");
         hooks_installed = true;
-        // 注意：这里不应该 dlclose(handle)，否则 Hook 会失效
         return true;
     } else {
         z_log("错误: shadowhook_hook_sym_name 调用失败");
-        // 如果 Hook 失败，可以关闭句柄
         dlclose(handle);
         return false;
     }
