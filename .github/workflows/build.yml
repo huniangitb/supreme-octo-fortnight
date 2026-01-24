@@ -24,12 +24,6 @@ jobs:
     # 设置 Android SDK（使用 packages 而不是 api-level）
     - name: Set up Android SDK
       uses: android-actions/setup-android@v3.2.2
-      with:
-        packages: |
-          platform-tools
-          platforms;android-34
-          build-tools;34.0.0
-          cmdline-tools;latest
     
     # 构建步骤
     - name: Build with Gradle
