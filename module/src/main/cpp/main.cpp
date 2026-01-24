@@ -4,56 +4,109 @@
 #include <unistd.h>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
+#include <vector>
+#include <string>
+#include <mutex>
+#include <thread>
 
 #include "zygisk.hpp"
+#include "shadowhook.h"
 
 static const char* TARGET_SOCKET_PATH = "/data/Namespace-Proxy/ipc.sock";
+static std::vector<std::string> g_block_rules;
+static std::mutex g_rule_mutex;
+static int g_companion_fd = -1;
 
 extern "C" const char* getprogname();
 
-static void companion_handler(int client_fd) {
-    auto send_and_close = [&](const char* msg) {
-        write(client_fd, msg, strlen(msg));
-        close(client_fd);
-    };
+// 判定是否属于媒体存储路径并命中规则
+static bool is_media_blocked(const char* path) {
+    if (!path) return false;
+    // 预过滤：仅处理媒体存储常见路径
+    if (strncmp(path, "/storage/", 9) != 0 && strncmp(path, "/sdcard", 7) != 0) return false;
 
-    char buffer[256] = {0};
+    std::lock_guard<std::mutex> lock(g_rule_mutex);
+    for (const auto& prefix : g_block_rules) {
+        if (strstr(path, prefix.c_str())) return true;
+    }
+    return false;
+}
+
+// Hook 处理函数
+typedef int (*openat_t)(int, const char*, int, mode_t);
+static void* orig_openat = nullptr;
+int my_openat(int fd, const char* path, int flags, mode_t mode) {
+    if (is_media_blocked(path)) return -1; 
+    return ((openat_t)orig_openat)(fd, path, flags, mode);
+}
+
+typedef int (*mkdirat_t)(int, const char*, mode_t);
+static void* orig_mkdirat = nullptr;
+int my_mkdirat(int fd, const char* path, mode_t mode) {
+    if (is_media_blocked(path)) return -1;
+    return ((mkdirat_t)orig_mkdirat)(fd, path, mode);
+}
+
+// 动态解析规则指令 (格式: "SET_RULES:path1,path2")
+static void update_rules(const char* msg) {
+    if (strncmp(msg, "SET_RULES:", 10) != 0) return;
+    std::lock_guard<std::mutex> lock(g_rule_mutex);
+    g_block_rules.clear();
+    char* data = strdup(msg + 10);
+    char* token = strtok(data, ",");
+    while (token) {
+        g_block_rules.emplace_back(token);
+        token = strtok(nullptr, ",");
+    }
+    free(data);
+}
+
+// 规则监听线程
+static void rule_listener() {
+    char buf[1024];
+    while (g_companion_fd >= 0) {
+        ssize_t len = read(g_companion_fd, buf, sizeof(buf) - 1);
+        if (len <= 0) break;
+        buf[len] = '\0';
+        update_rules(buf);
+    }
+}
+
+static void companion_handler(int client_fd) {
+    char buffer[1024] = {0};
     if (read(client_fd, buffer, sizeof(buffer)) <= 0) {
         close(client_fd);
         return;
     }
 
     int target_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (target_fd < 0) {
-        send_and_close("ERR_SOCKET_CREATE");
-        return;
-    }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
+    struct sockaddr_un addr{.sun_family = AF_UNIX};
     strncpy(addr.sun_path, TARGET_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
     if (connect(target_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         close(target_fd);
-        send_and_close("ERR_PROXY_CONN");
+        write(client_fd, "ERR_CONN", 8);
+        close(client_fd);
         return;
     }
 
     write(target_fd, buffer, strlen(buffer));
-    
-    char ack[16] = {0};
-    struct timeval tv = {1, 0};
-    setsockopt(target_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    
-    ssize_t ack_len = read(target_fd, ack, sizeof(ack));
-    write(client_fd, (ack_len > 0) ? ack : "OK_TIMEOUT", (ack_len > 0) ? (size_t)ack_len : 10);
 
-    close(target_fd);
-    close(client_fd);
+    // 双向转发指令
+    std::thread([client_fd, target_fd]() {
+        char b[1024];
+        while (true) {
+            ssize_t l = read(target_fd, b, sizeof(b));
+            if (l <= 0) break;
+            write(client_fd, b, l);
+        }
+        close(client_fd);
+        close(target_fd);
+    }).detach();
 }
 
-class AppReporterModule : public zygisk::ModuleBase {
+class MediaBlockModule : public zygisk::ModuleBase {
 public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
         this->api = api;
@@ -66,30 +119,29 @@ public:
             return;
         }
         this->companion_fd = api->connectCompanion();
-        api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
-        api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
         if (this->companion_fd < 0) return;
+        g_companion_fd = this->companion_fd;
 
-        struct timeval tv = {1, 0};
-        setsockopt(this->companion_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        // 初始化 ShadowHook
+        shadowhook_init(SHADOWHOOK_MODE_UNIQUE, true);
+        orig_openat = shadowhook_hook_symname("libc.so", "openat", (void*)my_openat, nullptr);
+        orig_mkdirat = shadowhook_hook_symname("libc.so", "mkdirat", (void*)my_mkdirat, nullptr);
 
         const char* process_name = nullptr;
         if (args->nice_name) process_name = env->GetStringUTFChars(args->nice_name, nullptr);
         if (!process_name) process_name = getprogname();
 
         char buffer[256];
-        snprintf(buffer, sizeof(buffer), "%s %d", process_name ? process_name : "unknown", getpid());
-        
-        write(this->companion_fd, buffer, strlen(buffer));
-
-        char signal[32] = {0};
-        read(this->companion_fd, signal, sizeof(signal) - 1);
+        snprintf(buffer, sizeof(buffer), "INIT %s %d", process_name ? process_name : "unknown", getpid());
+        write(g_companion_fd, buffer, strlen(buffer));
 
         if (args->nice_name && process_name) env->ReleaseStringUTFChars(args->nice_name, process_name);
-        close(this->companion_fd);
+
+        // 启动规则监听
+        std::thread(rule_listener).detach();
     }
 
 private:
@@ -98,5 +150,5 @@ private:
     int companion_fd;
 };
 
-REGISTER_ZYGISK_MODULE(AppReporterModule)
+REGISTER_ZYGISK_MODULE(MediaBlockModule)
 REGISTER_ZYGISK_COMPANION(companion_handler)
