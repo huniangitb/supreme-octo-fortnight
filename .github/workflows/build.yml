@@ -22,9 +22,7 @@ jobs:
       uses: android-actions/setup-android@v3.2.2
       with:
         # 只指定基本包，让 SDK 管理器处理依赖
-        packages: |
-          platform-tools
-          platforms;android-34
+        cmdline-tools-version: 11479570
     
     - name: Setup Gradle
       uses: gradle/actions/setup-gradle@v5
