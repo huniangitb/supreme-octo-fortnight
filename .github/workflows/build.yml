@@ -38,4 +38,4 @@ jobs:
     - uses: actions/upload-artifact@v4
       with:
         name: zygisk-imgui-modmenu
-        path: magisk_module_release/
+        path: module/build/magisk_module_release/
