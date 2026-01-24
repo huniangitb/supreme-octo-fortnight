@@ -1,9 +1,9 @@
 # 设置 CMake 最低版本
 cmake_minimum_required(VERSION 3.22.1)
 
-# 设置项目名，可以从 build.gradle 传入，也可以在这里写死
+# 设置项目名
 if (NOT DEFINED MODULE_NAME)
-    project(zygisk_ns_proxy) # 写一个默认名字
+    project(zygisk_ns_proxy)
 else ()
     project(${MODULE_NAME})
 endif ()
@@ -11,18 +11,41 @@ endif ()
 # 设置 C++ 标准
 set(CMAKE_CXX_STANDARD 20)
 
-# 添加你的模块库，源文件是 main.cpp
-# ${MODULE_NAME} 变量由 Zygisk 模板的 build.gradle 传入
-add_library(${MODULE_NAME} SHARED main.cpp)
+# ----------------- 嵌入式 Hook 库配置 -----------------
+# 确定要嵌入的 libshadowhook.so 路径
+if (CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
+    set(SHADOWHOOK_LIB_PATH "${CMAKE_CURRENT_SOURCE_DIR}/libshadowhook-64.so")
+elseif (CMAKE_ANDROID_ARCH_ABI STREQUAL "armeabi-v7a")
+    set(SHADOWHOOK_LIB_PATH "${CMAKE_CURRENT_SOURCE_DIR}/libshadowhook-32.so")
+else ()
+    message(FATAL_ERROR "Unsupported ABI: ${CMAKE_ANDROID_ARCH_ABI}. Only arm64-v8a and armeabi-v7a are supported for embedded loading.")
+endif ()
 
-# 只链接 Android 日志库，这是我们唯一需要的外部库
+# 定义输出头文件路径
+set(SHADOWHOOK_BLOB_HEADER "${CMAKE_CURRENT_BINARY_DIR}/shadowhook_blob.h")
+
+# 使用 xxd 命令将 .so 文件转换为 C 数组
+# 变量名将是 shadowhook_blob 和 shadowhook_blob_len
+add_custom_command(
+    OUTPUT ${SHADOWHOOK_BLOB_HEADER}
+    COMMAND xxd -i ${SHADOWHOOK_LIB_PATH}
+    > ${SHADOWHOOK_BLOB_HEADER}
+    DEPENDS ${SHADOWHOOK_LIB_PATH}
+    VERBATIM
+)
+
+# ----------------- 模块库配置 -----------------
+# 添加你的模块库，源文件是 zygisk_module.cpp
+add_library(${MODULE_NAME} SHARED zygisk_module.cpp)
+
+# 确保编译时能找到自动生成的头文件
+target_include_directories(${MODULE_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+# 链接 Android 日志库
 find_library(log-lib log)
-# 【已修正】确保变量名是 ${MODULE_NAME}，没有多余的字符
 target_link_libraries(${MODULE_NAME} ${log-lib})
 
-
-# ----------------- 可选：保留你的优化选项 -----------------
-# 这些优化选项对于 Zygisk 模块来说是很好的，可以保留
+# ----------------- 优化选项 -----------------
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fdata-sections -ffunction-sections -fno-stack-protector -fvisibility=hidden")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fdata-sections -ffunction-sections -fno-stack-protector -fvisibility=hidden -fno-exceptions -fno-rtti -fvisibility-inlines-hidden")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections")
