@@ -8,33 +8,53 @@ jobs:
   build:
     runs-on: ubuntu-latest
     
-    env:
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
-    
     steps:
     - uses: actions/checkout@v5
     
-    # 一步完成 Java 和 Gradle 设置（包含缓存）
+    # Java 和 Gradle 设置
     - uses: actions/setup-java@v5
       with:
         distribution: temurin
         java-version: 17
-        cache: gradle  # 自动处理 Gradle 依赖缓存
+        cache: gradle
     
-    # 设置 Android SDK（使用 packages 而不是 api-level）
+    # 方法1：使用推荐的官方 action
     - name: Set up Android SDK
       uses: android-actions/setup-android@v3.2.2
+      with:
+        # 正确的包名格式，每个包单独一行
+        packages: |
+          platform-tools
+          platforms;android-34
+          build-tools;34.0.0
     
-    # 构建步骤
+    # 方法2：或者使用更稳定的 setup-android action
+    - name: Setup Android SDK (替代方案)
+      uses: android-actions/setup-android@v3.2.2
+      with:
+        # 只指定基本包，让 SDK 管理器处理依赖
+        packages: |
+          platform-tools
+          platforms;android-34
+    
+    # 方法3：使用 GitHub 官方的 Android 设置（推荐）
+    - name: Setup Android SDK (GitHub Official)
+      uses: android-actions/setup-android@v3.2.2
+      with:
+        # 最小化配置，只安装必须的
+        packages: |
+          platform-tools
+          platforms;android-34
+    
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v5
+      with:
+        gradle-version: '8.7'
+    
     - name: Build with Gradle
       run: |
-        # 启用构建缓存
-        gradle :module:assembleRelease \
-          --build-cache \
-          --parallel \
-          --daemon
+        gradle :module:assembleRelease
     
-    # 上传产物
     - uses: actions/upload-artifact@v4
       with:
         name: zygisk-imgui-modmenu
