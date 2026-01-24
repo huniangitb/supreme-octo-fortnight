@@ -1,4 +1,3 @@
-# 设置 CMake 最低版本
 cmake_minimum_required(VERSION 3.22.1)
 
 # 设置项目名
@@ -25,14 +24,18 @@ endif ()
 set(SHADOWHOOK_BLOB_HEADER "${CMAKE_CURRENT_BINARY_DIR}/shadowhook_blob.h")
 
 # 使用 xxd 命令将 .so 文件转换为 C 数组
-# 变量名将是 shadowhook_blob 和 shadowhook_blob_len
+# 修正 xxd 命令的语法
 add_custom_command(
     OUTPUT ${SHADOWHOOK_BLOB_HEADER}
-    COMMAND xxd -i ${SHADOWHOOK_LIB_PATH}
-    > ${SHADOWHOOK_BLOB_HEADER}
-    DEPENDS ${SHADOWHOOK_LIB_PATH}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}
+    COMMAND xxd -i "${SHADOWHOOK_LIB_PATH}" > "${SHADOWHOOK_BLOB_HEADER}"
+    DEPENDS "${SHADOWHOOK_LIB_PATH}"
+    COMMENT "Generating shadowhook_blob.h from ${SHADOWHOOK_LIB_PATH}"
     VERBATIM
 )
+
+# 创建一个自定义目标来确保头文件生成
+add_custom_target(generate_shadowhook_blob DEPENDS ${SHADOWHOOK_BLOB_HEADER})
 
 # ----------------- 模块库配置 -----------------
 # 添加你的模块库，源文件是 zygisk_module.cpp
@@ -40,6 +43,9 @@ add_library(${MODULE_NAME} SHARED zygisk_module.cpp)
 
 # 确保编译时能找到自动生成的头文件
 target_include_directories(${MODULE_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+# 使模块库依赖于头文件生成
+add_dependencies(${MODULE_NAME} generate_shadowhook_blob)
 
 # 链接 Android 日志库
 find_library(log-lib log)
