@@ -21,7 +21,7 @@
 #define TARGET_SOCKET_PATH "/data/Namespace-Proxy/ipc.sock"
 
 // --- 全局变量 ---
-static std::vector<std::string> g_block_rules;
+static std.vector<std::string> g_block_rules;
 static std::mutex g_rule_mutex;
 static zygisk::Api* g_api = nullptr;
 static bool g_is_media_process = false;
@@ -34,20 +34,15 @@ static void z_log(const char* fmt, ...) {
     va_start(args, fmt);
     vsnprintf(msg, sizeof(msg), fmt, args);
     va_end(args);
-    // 输出格式: [PID][进程名] 消息内容
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "[%d][%s] %s", getpid(), g_process_name, msg);
 }
 
 // --- 路径判定逻辑 ---
 static bool is_path_blocked(const char* path) {
     if (!path) return false;
-
-    // 1. 硬编码拦截规则 (1DMP 文件夹及其下所有内容)
     if (strstr(path, "/storage/emulated/0/Download/1DMP")) {
         return true;
     }
-
-    // 2. 动态拦截规则 (来自 Socket)
     std::lock_guard<std::mutex> lock(g_rule_mutex);
     for (const auto& prefix : g_block_rules) {
         if (strstr(path, prefix.c_str())) return true;
@@ -91,30 +86,43 @@ static bool install_hooks() {
     const char* sh_path = "/data/adb/modules/Namespace-Proxy/lib/armeabi-v7a/libshadowhook.so";
 #endif
 
-    // 1. 加载 ShadowHook 动态库
     void* handle = dlopen(sh_path, RTLD_NOW);
     if (!handle) {
         z_log("错误: 无法加载 libshadowhook.so: %s", dlerror());
         return false;
     }
 
-    // 2. 初始化 ShadowHook
+    // dlsym shadowhook_init
     auto sh_init = (int (*)(int, bool))dlsym(handle, "shadowhook_init");
     if (!sh_init || sh_init(SHADOWHOOK_MODE_UNIQUE, false) != 0) {
         z_log("错误: shadowhook_init 失败");
+        dlclose(handle);
         return false;
     }
 
-    // 3. 执行 Hook
-    orig_openat = shadowhook_hook_sym_name("libc.so", "openat", (void*)my_openat, nullptr);
-    orig_mkdirat = shadowhook_hook_sym_name("libc.so", "mkdirat", (void*)my_mkdirat, nullptr);
+    // 【关键修复】
+    // dlsym shadowhook_hook_sym_name，以避免链接器错误
+    typedef void* (*sh_hook_sym_name_t)(const char*, const char*, void*, void**);
+    auto sh_hook_sym_name = (sh_hook_sym_name_t)dlsym(handle, "shadowhook_hook_sym_name");
+    if (!sh_hook_sym_name) {
+        z_log("错误: dlsym shadowhook_hook_sym_name 失败");
+        dlclose(handle);
+        return false;
+    }
+
+    // 通过函数指针调用 Hook
+    orig_openat = sh_hook_sym_name("libc.so", "openat", (void*)my_openat, nullptr);
+    orig_mkdirat = sh_hook_sym_name("libc.so", "mkdirat", (void*)my_mkdirat, nullptr);
 
     if (orig_openat && orig_mkdirat) {
         z_log("成功: 系统 Hook 已自动安装 (openat/mkdirat)");
         hooks_installed = true;
+        // 注意：这里不应该 dlclose(handle)，否则 Hook 会失效
         return true;
     } else {
-        z_log("错误: shadowhook_hook_sym_name 失败");
+        z_log("错误: shadowhook_hook_sym_name 调用失败");
+        // 如果 Hook 失败，可以关闭句柄
+        dlclose(handle);
         return false;
     }
 }
@@ -124,21 +132,17 @@ static void connection_keeper_thread() {
     while (true) {
         int fd = g_api->connectCompanion();
         if (fd < 0) {
-            sleep(5); // 连接失败则等待
+            sleep(5);
             continue;
         }
-
-        // 上报进程信息给后端
         char report[512];
         snprintf(report, sizeof(report), "REPORT %s %d STATUS:HOOKED", g_process_name, getpid());
         write(fd, report, strlen(report));
-
         char buf[8192];
         while (true) {
             ssize_t len = read(fd, buf, sizeof(buf) - 1);
-            if (len <= 0) break; // 掉线
+            if (len <= 0) break;
             buf[len] = 0;
-
             if (strncmp(buf, "SET_RULES:", 10) == 0) {
                 std::lock_guard<std::mutex> lock(g_rule_mutex);
                 g_block_rules.clear();
@@ -151,7 +155,8 @@ static void connection_keeper_thread() {
                 free(data);
                 z_log("动态规则已同步，当前总规则数: %zu", g_block_rules.size());
             } else if (strncmp(buf, "SKIP", 4) == 0) {
-                close(fd); return;
+                close(fd);
+                return;
             }
         }
         close(fd);
@@ -164,20 +169,15 @@ static void companion_handler(int client_fd) {
     char buffer[1024];
     ssize_t n = read(client_fd, buffer, sizeof(buffer));
     if (n <= 0) { close(client_fd); return; }
-
     int target_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr{.sun_family = AF_UNIX};
     strncpy(addr.sun_path, TARGET_SOCKET_PATH, sizeof(addr.sun_path) - 1);
-
     if (connect(target_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         write(client_fd, "SKIP", 4);
         close(client_fd); close(target_fd);
         return;
     }
-
-    write(target_fd, buffer, n); // 转发 REPORT
-
-    // 双向数据转发
+    write(target_fd, buffer, n);
     std::thread([client_fd, target_fd]() {
         char b[4096];
         while (true) {
@@ -197,39 +197,28 @@ public:
         this->env = env;
         g_api = api;
     }
-
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         const char* nice_name = nullptr;
         if (args->nice_name) nice_name = env->GetStringUTFChars(args->nice_name, nullptr);
-        
         if (nice_name) {
-            // 自动判断媒体相关进程
-            if (strstr(nice_name, "android.providers.media") || 
+            if (strstr(nice_name, "android.providers.media") ||
                 strstr(nice_name, "android.process.media") ||
                 strstr(nice_name, "com.google.android.providers.media")) {
-                
                 g_is_media_process = true;
                 strncpy(g_process_name, nice_name, sizeof(g_process_name) - 1);
             }
             env->ReleaseStringUTFChars(args->nice_name, nice_name);
         }
     }
-
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
         if (!g_is_media_process) {
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
         }
-
-        // 1. 自动执行 Hook，无需等待 Socket 指令
         install_hooks();
-
-        // 2. 启动 Socket 线程（用于汇报状态和后端交互）
         std::thread(connection_keeper_thread).detach();
-
         z_log("媒体注入流程初始化完毕");
     }
-
 private:
     zygisk::Api *api;
     JNIEnv *env;
