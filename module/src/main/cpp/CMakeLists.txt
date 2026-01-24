@@ -14,8 +14,11 @@ set(CMAKE_CXX_STANDARD 20)
 # 确定要嵌入的 libshadowhook.so 路径
 if (CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
     set(SHADOWHOOK_LIB_PATH "${CMAKE_CURRENT_SOURCE_DIR}/libshadowhook-64.so")
+    # 使用 -n 选项指定变量名
+    set(XXD_COMMAND "xxd -i -n shadowhook_blob ${SHADOWHOOK_LIB_PATH} > ${CMAKE_CURRENT_BINARY_DIR}/shadowhook_blob.h")
 elseif (CMAKE_ANDROID_ARCH_ABI STREQUAL "armeabi-v7a")
     set(SHADOWHOOK_LIB_PATH "${CMAKE_CURRENT_SOURCE_DIR}/libshadowhook-32.so")
+    set(XXD_COMMAND "xxd -i -n shadowhook_blob ${SHADOWHOOK_LIB_PATH} > ${CMAKE_CURRENT_BINARY_DIR}/shadowhook_blob.h")
 else ()
     message(FATAL_ERROR "Unsupported ABI: ${CMAKE_ANDROID_ARCH_ABI}. Only arm64-v8a and armeabi-v7a are supported for embedded loading.")
 endif ()
@@ -24,11 +27,10 @@ endif ()
 set(SHADOWHOOK_BLOB_HEADER "${CMAKE_CURRENT_BINARY_DIR}/shadowhook_blob.h")
 
 # 使用 xxd 命令将 .so 文件转换为 C 数组
-# 修正 xxd 命令的语法
 add_custom_command(
     OUTPUT ${SHADOWHOOK_BLOB_HEADER}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}
-    COMMAND xxd -i "${SHADOWHOOK_LIB_PATH}" > "${SHADOWHOOK_BLOB_HEADER}"
+    COMMAND sh -c "${XXD_COMMAND}"
     DEPENDS "${SHADOWHOOK_LIB_PATH}"
     COMMENT "Generating shadowhook_blob.h from ${SHADOWHOOK_LIB_PATH}"
     VERBATIM
