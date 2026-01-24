@@ -18,17 +18,6 @@ jobs:
         java-version: 17
         cache: gradle
     
-    # 方法1：使用推荐的官方 action
-    - name: Set up Android SDK
-      uses: android-actions/setup-android@v3.2.2
-      with:
-        # 正确的包名格式，每个包单独一行
-        packages: |
-          platform-tools
-          platforms;android-34
-          build-tools;34.0.0
-    
-    # 方法2：或者使用更稳定的 setup-android action
     - name: Setup Android SDK (替代方案)
       uses: android-actions/setup-android@v3.2.2
       with:
@@ -36,13 +25,6 @@ jobs:
         packages: |
           platform-tools
           platforms;android-34
-    
-    # 方法3：使用 GitHub 官方的 Android 设置（推荐）
-    - name: Setup Android SDK (GitHub Official)
-      uses: android-actions/setup-android@v3.2.2
-      with:
-        # 最小化配置，只安装必须的
-        cmdline-tools-version: 11479570 
     
     - name: Setup Gradle
       uses: gradle/actions/setup-gradle@v5
