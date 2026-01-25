@@ -11,7 +11,7 @@
 #include <fcntl.h>
 #include <linux/limits.h>
 #include <stdarg.h>
-#include <stdlib.h>  // 添加此头文件以声明 malloc 和 free
+#include <stdlib.h>
 
 #include "zygisk.hpp"
 #include "dobby.h"
@@ -55,7 +55,10 @@ static char* redirect_path(const char *orig_path) {
     }
     
     char *new_path = (char*)malloc(new_len);
-    if (!new_path) return nullptr;
+    if (!new_path) {
+        LOGE("Memory allocation failed for new path");
+        return nullptr;
+    }
     
     // 构造新路径
     snprintf(new_path, new_len, "%s%s", TARGET_PATH, orig_path + strlen(SOURCE_PATH));
@@ -120,6 +123,8 @@ static void install_dobby_hooks() {
     if (openat_addr) {
         if (DobbyHook(openat_addr, (dobby_dummy_func_t)fake_openat, (dobby_dummy_func_t*)&orig_openat) != 0) {
             LOGE("Failed to hook openat");
+        } else {
+            LOGI("Successfully hooked openat");
         }
     } else {
         LOGE("openat not found: %s", dlerror());
@@ -130,6 +135,8 @@ static void install_dobby_hooks() {
     if (mkdirat_addr) {
         if (DobbyHook(mkdirat_addr, (dobby_dummy_func_t)fake_mkdirat, (dobby_dummy_func_t*)&orig_mkdirat) != 0) {
             LOGE("Failed to hook mkdirat");
+        } else {
+            LOGI("Successfully hooked mkdirat");
         }
     } else {
         LOGE("mkdirat not found: %s", dlerror());
@@ -145,19 +152,26 @@ static void companion_handler(int client_fd) {
     };
 
     char buffer[256] = {0};
-    if (read(client_fd, buffer, sizeof(buffer)) <= 0) {
+    ssize_t read_len = read(client_fd, buffer, sizeof(buffer) - 1);
+    if (read_len <= 0) {
+        LOGE("Read from client failed: %s", strerror(errno));
         close(client_fd);
         return;
     }
+    buffer[read_len] = '\0';
+
+    LOGI("Received from app: %s", buffer);
 
     // 检查锁文件
     if (access(LOCK_FILE_PATH, F_OK) != 0) {
+        LOGI("Lock file not found, skipping hook");
         send_and_close("SKIP_NO_LOCK");
         return;
     }
 
-    int target_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int target_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (target_fd < 0) {
+        LOGE("Socket creation failed: %s", strerror(errno));
         send_and_close("ERR_SOCKET_CREATE");
         return;
     }
@@ -168,22 +182,38 @@ static void companion_handler(int client_fd) {
     strncpy(addr.sun_path, TARGET_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
     if (connect(target_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        LOGE("Connection to backend failed: %s", strerror(errno));
         close(target_fd);
         send_and_close("ERR_PROXY_CONN");
         return;
     }
 
-    write(target_fd, buffer, strlen(buffer));
+    LOGI("Successfully connected to backend socket");
+
+    ssize_t write_len = write(target_fd, buffer, strlen(buffer));
+    if (write_len != (ssize_t)strlen(buffer)) {
+        LOGE("Partial/failed write to backend: %zd/%zu", write_len, strlen(buffer));
+    } else {
+        LOGI("Successfully sent data to backend");
+    }
     
     char ack[16] = {0};
     struct timeval tv = {1, 0};
     setsockopt(target_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     
-    ssize_t ack_len = read(target_fd, ack, sizeof(ack));
-    write(client_fd, (ack_len > 0) ? ack : "OK_TIMEOUT", (ack_len > 0) ? (size_t)ack_len : 10);
+    ssize_t ack_len = read(target_fd, ack, sizeof(ack) - 1);
+    if (ack_len > 0) {
+        ack[ack_len] = '\0';
+        LOGI("Received response from backend: %s", ack);
+        write(client_fd, ack, ack_len);
+    } else {
+        LOGE("Read from backend failed or timed out: %s", strerror(errno));
+        write(client_fd, "OK_TIMEOUT", 10);
+    }
 
     close(target_fd);
     close(client_fd);
+    LOGI("Companion handler completed");
 }
 
 class AppReporterModule : public zygisk::ModuleBase {
@@ -191,15 +221,23 @@ public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
         this->api = api;
         this->env = env;
+        LOGI("Module loaded successfully");
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         // 过滤 UID < 1001 的系统应用
         if (args->uid < 1001) {
+            LOGI("Skipping system app with UID: %d", args->uid);
             this->companion_fd = -1;
             return;
         }
+        
+        LOGI("Connecting to companion for UID: %d", args->uid);
         this->companion_fd = api->connectCompanion();
+        if (companion_fd < 0) {
+            LOGE("Failed to connect to companion");
+        }
+        
         api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
         api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
     }
@@ -209,27 +247,50 @@ public:
         if (args->nice_name) process_name = env->GetStringUTFChars(args->nice_name, nullptr);
         if (!process_name) process_name = getprogname();
         
+        pid_t pid = getpid();
+        LOGI("App specialized - Process: %s, PID: %d, UID: %d", 
+             process_name ? process_name : "unknown", pid, args->uid);
+        
         // 检查是否为媒体提供者进程
         if (process_name && strcmp(process_name, "com.android.providers.media.module") == 0) {
-            LOGI("Detected media provider process");
+            LOGI("Detected media provider process: %s (PID: %d)", process_name, pid);
             is_media_provider = true;
         }
         
         if (companion_fd >= 0) {
             // 设置 1 秒超时强制放行
             struct timeval tv = {1, 0};
-            setsockopt(companion_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            if (setsockopt(companion_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+                LOGE("Failed to set socket timeout: %s", strerror(errno));
+            }
 
             char buffer[256];
-            snprintf(buffer, sizeof(buffer), "%s %d", process_name ? process_name : "unknown", getpid());
+            snprintf(buffer, sizeof(buffer), "%s %d", process_name ? process_name : "unknown", pid);
             
-            write(companion_fd, buffer, strlen(buffer));
-
+            LOGI("Sending to companion: %s", buffer);
+            ssize_t write_len = write(companion_fd, buffer, strlen(buffer));
+            if (write_len != (ssize_t)strlen(buffer)) {
+                LOGE("Partial/failed write to companion: %zd/%zu, error: %s", 
+                     write_len, strlen(buffer), strerror(errno));
+            }
+            
             char signal[32] = {0};
             // 阻塞直到信号返回或超时
-            read(companion_fd, signal, sizeof(signal) - 1);
+            ssize_t read_len = read(companion_fd, signal, sizeof(signal) - 1);
+            if (read_len > 0) {
+                signal[read_len] = '\0';
+                LOGI("Received from companion: %s", signal);
+            } else if (read_len == 0) {
+                LOGE("Companion closed connection unexpectedly");
+            } else {
+                LOGE("Read from companion failed or timed out: %s", strerror(errno));
+            }
+            
             close(companion_fd);
             companion_fd = -1;
+        } else {
+            LOGI("No companion connection available for process: %s", 
+                 process_name ? process_name : "unknown");
         }
         
         // 仅在媒体提供者进程中安装 hook
