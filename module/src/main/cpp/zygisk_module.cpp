@@ -45,7 +45,6 @@ static int (*orig_fstatat)(int dirfd, const char *pathname, struct stat *buf, in
 static int (*orig_access)(const char *pathname, int mode);
 static int (*orig_stat)(const char *pathname, struct stat *buf);
 static int (*orig_lstat)(const char *pathname, struct stat *buf);
-
 struct linux_dirent64 { 
     uint64_t d_ino; 
     int64_t d_off; 
@@ -63,10 +62,22 @@ static std::string normalize_path(const char* p) {
     return s;
 }
 
+// 判断是否为媒体存储进程
 static bool is_target_media_process(const char* name) {
     if (!name) return false;
-    return (strstr(name, "com.android.providers.media") != nullptr || 
-            strstr(name, "android.process.media") != nullptr);
+    
+    // 媒体提供者进程
+    const char* media_processes[] = {
+        "com.android.providers.media",
+        "android.process.media"
+    };
+    
+    for (const char* proc : media_processes) {
+        if (strstr(name, proc) != nullptr) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ==================== 路径重定向逻辑 ====================
@@ -314,7 +325,7 @@ static void parse_rules(const char* data) {
         return;
     }
     
-    LOGI("[Rules] 原始规则数据: %s", data);
+    LOGI("[Rules] 收到规则数据，长度: %d", (int)strlen(data));
     
     if (strncmp(data, "SET_RULES:", 10) != 0) {
         LOGE("[Rules] 无效规则格式");
@@ -323,7 +334,6 @@ static void parse_rules(const char* data) {
     
     g_rules.clear();
     std::string s(data + 10);
-    LOGI("[Rules] 解析规则字符串: %s", s.c_str());
     
     size_t pos = 0, next;
     int rule_count = 0;
@@ -347,7 +357,7 @@ static void parse_rules(const char* data) {
             
             if (!rule.source.empty() && !rule.target.empty()) {
                 g_rules.push_back(rule);
-                LOGI("[Rules] 添加规则: %s -> %s", rule.source.c_str(), rule.target.c_str());
+                LOGI("[Rules] 规则 %d: %s -> %s", rule_count + 1, rule.source.c_str(), rule.target.c_str());
                 rule_count++;
             }
         }
@@ -356,7 +366,7 @@ static void parse_rules(const char* data) {
         pos = next + 1;
     }
     
-    LOGI("[Rules] 共加载 %d 条规则", rule_count);
+    LOGI("[Rules] 共解析 %d 条规则", rule_count);
 }
 
 // ==================== Hook 安装 ====================
@@ -366,7 +376,7 @@ static void install_media_shields() {
         return;
     }
     
-    LOGI("[Shield] 检测到媒体中心，启动隔离保护... 规则数量: %zu", g_rules.size());
+    LOGI("[Shield] 媒体存储进程检测，安装Dobby Hook... 规则数量: %zu", g_rules.size());
     
     void *libc_handle = dlopen("libc.so", RTLD_NOW);
     if (!libc_handle) {
@@ -374,7 +384,6 @@ static void install_media_shields() {
         return;
     }
     
-    // 定义 Hook 宏
     #define HOOK_FUNC(func_name) do { \
         void* orig_sym = dlsym(libc_handle, #func_name); \
         if (orig_sym) { \
@@ -388,7 +397,7 @@ static void install_media_shields() {
         } \
     } while(0)
     
-    // 安装所有 Hook
+    // 只安装必要的Hook
     HOOK_FUNC(openat);
     HOOK_FUNC(mkdirat);
     HOOK_FUNC(faccessat);
@@ -403,7 +412,7 @@ static void install_media_shields() {
     dlclose(libc_handle);
     g_hooks_installed = true;
     
-    LOGI("[Shield] 媒体保护隔离已激活");
+    LOGI("[Shield] 媒体存储保护Hook已激活");
 }
 
 // ==================== Companion 处理 ====================
@@ -482,7 +491,6 @@ static void companion_handler(int client_fd) {
         write(client_fd, rule_data, received);
     } else {
         LOGI("[Companion] 未收到规则数据，返回空规则");
-        // 发送空响应
         const char* empty_rules = "SET_RULES:";
         write(client_fd, empty_rules, strlen(empty_rules));
     }
@@ -506,9 +514,11 @@ public:
             // 系统进程：不连接 Companion，并卸载模块
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             this->companion_fd = -1;
+            this->is_media_process = false;
             return; 
         }
         
+        // 先连接 Companion
         this->companion_fd = api->connectCompanion();
         LOGI("[Module] 用户应用 UID: %d, Companion FD: %d", args->uid, this->companion_fd);
     }
@@ -528,6 +538,10 @@ public:
         int pid = getpid();
         LOGI("[Module] 进程启动: %s (PID: %d, UID: %d)", process_name, pid, getuid());
         
+        // 判断是否为媒体存储进程
+        this->is_media_process = is_target_media_process(process_name);
+        LOGI("[Module] 是否为媒体存储进程: %s", this->is_media_process ? "是" : "否");
+        
         if (companion_fd >= 0) {
             // 发送上报消息
             char report[512];
@@ -539,11 +553,10 @@ public:
             if (sent > 0) {
                 LOGI("[Module] 上报发送成功: %zd 字节", sent);
                 
-                // 判断是否为媒体进程
-                bool is_media = is_target_media_process(process_name);
-                
-                if (is_media) {
-                    LOGI("[Module] 目标媒体进程，准备接收规则...");
+                // ============ 关键修改 ============
+                // 只有媒体存储进程才接收规则和安装Hook
+                if (this->is_media_process) {
+                    LOGI("[Module] 目标媒体存储进程，接收规则并安装Hook...");
                     
                     // 接收规则数据
                     char rule_data[8192] = {0};
@@ -559,18 +572,23 @@ public:
                         // 解析规则
                         parse_rules(rule_data);
                         
-                        // 安装 Hook
+                        // 安装Hook
                         if (!g_rules.empty()) {
                             install_media_shields();
+                            LOGI("[Module] Dobby Hook 已安装");
                         } else {
                             LOGI("[Module] 无有效规则，不安装 Hook");
+                            // 即使没有规则也卸载模块，因为这是媒体进程但不需要Hook
+                            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
                         }
                     } else {
                         LOGI("[Module] 未收到规则或规则为空");
+                        // 没有规则也卸载模块
+                        api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
                     }
                 } else {
-                    LOGI("[Module] 非媒体进程，上报后卸载模块");
-                    // 普通应用：上报后立即卸载模块，减少内存占用和检测风险
+                    // 非媒体存储进程：上报后立即卸载模块，不接收规则
+                    LOGI("[Module] 非媒体存储进程，上报后卸载模块");
                     api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
                 }
             } else {
@@ -594,6 +612,7 @@ private:
     zygisk::Api *api;
     JNIEnv *env;
     int companion_fd = -1;
+    bool is_media_process = false;
 };
 
 // ==================== 模块注册 ====================
