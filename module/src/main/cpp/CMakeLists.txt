@@ -21,14 +21,14 @@ find_library(log-lib log)
 target_link_libraries(${MODULE_NAME} ${log-lib})
 
 # -------------------------------------------------------------------
-# 极简配置 (完全避免C++运行时依赖)
+# 修复配置 (保留必要内置函数)
 # -------------------------------------------------------------------
 
 # C 编译器标志
 set(C_FLAGS "-fdata-sections -ffunction-sections -fno-stack-protector -fvisibility=hidden -fno-stack-protector")
 
-# C++ 编译器标志 (完全禁用C++特性)
-set(CXX_FLAGS "-fdata-sections -ffunction-sections -fno-stack-protector -fvisibility=hidden -fno-exceptions -fno-rtti -fno-use-cxa-atexit -fno-threadsafe-statics -fvisibility-inlines-hidden -fno-builtin")
+# C++ 编译器标志 (禁用C++特性但保留内置函数)
+set(CXX_FLAGS "-fdata-sections -ffunction-sections -fno-stack-protector -fvisibility=hidden -fno-exceptions -fno-rtti -fno-use-cxa-atexit -fno-threadsafe-statics -fvisibility-inlines-hidden")
 
 # 链接器标志：极简依赖
 set(LINKER_FLAGS "-Wl,--gc-sections -Wl,--as-needed -Wl,--exclude-libs,ALL -Wl,--no-undefined -Wl,--hash-style=both")

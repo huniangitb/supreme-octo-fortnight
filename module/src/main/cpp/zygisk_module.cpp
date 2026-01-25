@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
+#include <stdio.h>  // 添加这一行以获取snprintf
 
 #include "zygisk.hpp"
 
