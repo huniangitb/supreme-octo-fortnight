@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <linux/limits.h>
 #include <stdarg.h>
+#include <stdlib.h>  // 添加此头文件以声明 malloc 和 free
 
 #include "zygisk.hpp"
 #include "dobby.h"
@@ -240,8 +241,8 @@ public:
     }
 
 private:
-    zygisk::Api *api;
-    JNIEnv *env;
+    zygisk::Api *api = nullptr;
+    JNIEnv *env = nullptr;
     int companion_fd = -1;
 };
 
