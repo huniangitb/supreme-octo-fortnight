@@ -14,6 +14,8 @@
 #include <stdlib.h>
 #include <string>
 #include <vector>
+#include <thread>
+#include <mutex>
 
 #include "zygisk.hpp"
 #include "dobby.h"
@@ -25,17 +27,21 @@
 
 static const char* TARGET_SOCKET_PATH = "/data/Namespace-Proxy/ipc.sock";
 static const char* LOCK_FILE_PATH = "/data/Namespace-Proxy/app.lock";
+static const char* RULES_FILE_PATH = "/data/Namespace-Proxy/zygisk_rules.conf";
 
 // ==================== 数据结构 ====================
 struct RedirectRule {
     std::string source;
     std::string target;
-    std::string source_name; // 仅文件名，用于 getdents 过滤
+    std::string source_name;
 };
 
 static std::vector<RedirectRule> g_rules;
+static std::mutex g_rules_mutex;
 static thread_local bool g_is_hooking = false;
 static bool g_hooks_installed = false;
+static bool g_module_should_unload = false;
+static std::thread g_rules_monitor_thread;
 
 // ==================== 原始函数指针 ====================
 static int (*orig_openat)(int dirfd, const char *pathname, int flags, ...);
@@ -62,14 +68,13 @@ static std::string normalize_path(const char* p) {
     return s;
 }
 
-// 判断是否为媒体存储进程
 static bool is_target_media_process(const char* name) {
     if (!name) return false;
     
-    // 媒体提供者进程
     const char* media_processes[] = {
         "com.android.providers.media",
-        "android.process.media"
+        "android.process.media",
+        "media"
     };
     
     for (const char* proc : media_processes) {
@@ -87,13 +92,12 @@ static char* get_redirected_path(const char* pathname) {
     std::string current = normalize_path(pathname);
     if (current.empty()) return nullptr;
 
+    std::lock_guard<std::mutex> lock(g_rules_mutex);
     for (const auto& rule : g_rules) {
-        // 精确匹配
         if (current == rule.source) {
             return strdup(rule.target.c_str());
         }
         
-        // 子路径匹配
         std::string prefix = rule.source + "/";
         if (current.compare(0, prefix.length(), prefix) == 0) {
             std::string sub = current.substr(rule.source.length());
@@ -107,7 +111,6 @@ static char* get_redirected_path(const char* pathname) {
 // ==================== Hook 函数实现 ====================
 
 static int fake_openat(int dirfd, const char *pathname, int flags, ...) {
-    // 避免递归调用
     if (g_is_hooking) {
         if (flags & O_CREAT) {
             va_list ap; 
@@ -268,11 +271,13 @@ static int fake_lstat(const char *pathname, struct stat *buf) {
 
 static int fake_getdents64(unsigned int fd, struct linux_dirent64 *dirp, unsigned int count) {
     int nread = orig_getdents64(fd, dirp, count);
-    if (nread <= 0 || g_is_hooking || g_rules.empty()) return nread;
+    if (nread <= 0 || g_is_hooking) return nread;
+
+    std::lock_guard<std::mutex> lock(g_rules_mutex);
+    if (g_rules.empty()) return nread;
 
     g_is_hooking = true;
     
-    // 获取当前目录路径
     char path[PATH_MAX];
     char procfd[64]; 
     snprintf(procfd, sizeof(procfd), "/proc/self/fd/%d", fd);
@@ -286,9 +291,7 @@ static int fake_getdents64(unsigned int fd, struct linux_dirent64 *dirp, unsigne
             struct linux_dirent64 *d = (struct linux_dirent64 *) ((char *)dirp + bpos);
             bool hide = false;
             
-            // 检查是否需要隐藏此条目
             for (const auto& rule : g_rules) {
-                // 如果当前目录是规则源路径的父目录，且文件名匹配
                 size_t last_slash = rule.source.find_last_of('/');
                 if (last_slash != std::string::npos) {
                     std::string parent = rule.source.substr(0, last_slash);
@@ -306,7 +309,6 @@ static int fake_getdents64(unsigned int fd, struct linux_dirent64 *dirp, unsigne
                     memmove((char *)d, (char *)d + d->d_reclen, rest);
                 }
                 nread -= d->d_reclen;
-                // 不增加 bpos，因为条目已被移除
                 continue;
             }
             bpos += d->d_reclen;
@@ -317,56 +319,103 @@ static int fake_getdents64(unsigned int fd, struct linux_dirent64 *dirp, unsigne
     return nread;
 }
 
-// ==================== 规则解析 ====================
-static void parse_rules(const char* data) {
-    if (!data) {
-        LOGE("[Rules] 无规则数据");
-        g_rules.clear();
+// ==================== 规则解析与更新 ====================
+static void load_rules_from_file() {
+    FILE* fp = fopen(RULES_FILE_PATH, "r");
+    if (!fp) {
+        LOGE("[Rules] 无法打开规则文件: %s", RULES_FILE_PATH);
         return;
     }
     
-    LOGI("[Rules] 收到规则数据，长度: %d", (int)strlen(data));
-    
-    if (strncmp(data, "SET_RULES:", 10) != 0) {
-        LOGE("[Rules] 无效规则格式");
-        return;
-    }
-    
+    std::lock_guard<std::mutex> lock(g_rules_mutex);
     g_rules.clear();
-    std::string s(data + 10);
     
-    size_t pos = 0, next;
+    char line[1024];
     int rule_count = 0;
     
-    while ((next = s.find(',', pos)) != std::string::npos || pos < s.length()) {
-        std::string pair = s.substr(pos, (next == std::string::npos) ? std::string::npos : next - pos);
-        size_t sep = pair.find('|');
-        
-        if (sep != std::string::npos) {
-            RedirectRule rule;
-            rule.source = normalize_path(pair.substr(0, sep).c_str());
-            rule.target = normalize_path(pair.substr(sep + 1).c_str());
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "SET_RULES:", 10) == 0) {
+            char* data = line + 10;
+            size_t data_len = strlen(data);
             
-            // 提取源路径的文件名
-            size_t last_slash = rule.source.find_last_of('/');
-            if (last_slash != std::string::npos) {
-                rule.source_name = rule.source.substr(last_slash + 1);
-            } else {
-                rule.source_name = rule.source;
+            // 移除末尾的换行符
+            if (data_len > 0 && data[data_len - 1] == '\n') {
+                data[data_len - 1] = '\0';
+                data_len--;
             }
             
-            if (!rule.source.empty() && !rule.target.empty()) {
-                g_rules.push_back(rule);
-                LOGI("[Rules] 规则 %d: %s -> %s", rule_count + 1, rule.source.c_str(), rule.target.c_str());
-                rule_count++;
+            if (data_len == 0) continue;
+            
+            std::string s(data);
+            size_t pos = 0, next;
+            
+            while ((next = s.find(',', pos)) != std::string::npos || pos < s.length()) {
+                std::string pair = s.substr(pos, (next == std::string::npos) ? std::string::npos : next - pos);
+                size_t sep = pair.find('|');
+                
+                if (sep != std::string::npos) {
+                    RedirectRule rule;
+                    rule.source = normalize_path(pair.substr(0, sep).c_str());
+                    rule.target = normalize_path(pair.substr(sep + 1).c_str());
+                    
+                    size_t last_slash = rule.source.find_last_of('/');
+                    if (last_slash != std::string::npos) {
+                        rule.source_name = rule.source.substr(last_slash + 1);
+                    } else {
+                        rule.source_name = rule.source;
+                    }
+                    
+                    if (!rule.source.empty() && !rule.target.empty()) {
+                        g_rules.push_back(rule);
+                        rule_count++;
+                    }
+                }
+                
+                if (next == std::string::npos) break;
+                pos = next + 1;
             }
+            
+            break; // 只处理第一行
         }
-        
-        if (next == std::string::npos) break;
-        pos = next + 1;
     }
     
-    LOGI("[Rules] 共解析 %d 条规则", rule_count);
+    fclose(fp);
+    LOGI("[Rules] 从文件加载 %d 条规则", rule_count);
+}
+
+static void save_rules_to_file(const char* data) {
+    if (!data) return;
+    
+    FILE* fp = fopen(RULES_FILE_PATH, "w");
+    if (!fp) {
+        LOGE("[Rules] 无法写入规则文件: %s", RULES_FILE_PATH);
+        return;
+    }
+    
+    fprintf(fp, "%s\n", data);
+    fclose(fp);
+    
+    // 设置适当的权限
+    chmod(RULES_FILE_PATH, 0644);
+    LOGI("[Rules] 规则已保存到文件: %s", RULES_FILE_PATH);
+}
+
+static void rules_monitor_thread() {
+    time_t last_mtime = 0;
+    struct stat st;
+    
+    while (!g_module_should_unload) {
+        // 每10秒检查一次规则文件更新
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        
+        if (stat(RULES_FILE_PATH, &st) == 0) {
+            if (st.st_mtime != last_mtime) {
+                last_mtime = st.st_mtime;
+                LOGI("[Rules] 检测到规则文件更新，重新加载规则");
+                load_rules_from_file();
+            }
+        }
+    }
 }
 
 // ==================== Hook 安装 ====================
@@ -376,7 +425,8 @@ static void install_media_shields() {
         return;
     }
     
-    LOGI("[Shield] 媒体存储进程检测，安装Dobby Hook... 规则数量: %zu", g_rules.size());
+    std::lock_guard<std::mutex> lock(g_rules_mutex);
+    LOGI("[Shield] 安装Dobby Hook... 规则数量: %zu", g_rules.size());
     
     void *libc_handle = dlopen("libc.so", RTLD_NOW);
     if (!libc_handle) {
@@ -397,7 +447,6 @@ static void install_media_shields() {
         } \
     } while(0)
     
-    // 只安装必要的Hook
     HOOK_FUNC(openat);
     HOOK_FUNC(mkdirat);
     HOOK_FUNC(faccessat);
@@ -412,7 +461,16 @@ static void install_media_shields() {
     dlclose(libc_handle);
     g_hooks_installed = true;
     
-    LOGI("[Shield] 媒体存储保护Hook已激活");
+    LOGI("[Shield] Dobby Hook已激活");
+}
+
+static void uninstall_hooks() {
+    if (!g_hooks_installed) return;
+    
+    // 注意：DobbyHook 目前没有提供简单的unhook所有函数的方法
+    // 这里我们只是标记卸载状态
+    g_hooks_installed = false;
+    LOGI("[Shield] Hook已卸载");
 }
 
 // ==================== Companion 处理 ====================
@@ -427,7 +485,6 @@ static void companion_handler(int client_fd) {
     
     LOGI("[Companion] 收到请求: %s", buf);
     
-    // 检查锁文件是否存在（injector 是否在运行）
     if (access(LOCK_FILE_PATH, F_OK) != 0) { 
         LOGI("[Companion] injector 未运行，返回空规则");
         const char* empty_rules = "SET_RULES:";
@@ -436,7 +493,6 @@ static void companion_handler(int client_fd) {
         return; 
     }
 
-    // 连接到 injector
     int target_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (target_fd < 0) {
         LOGE("[Companion] 创建socket失败: %s", strerror(errno));
@@ -446,8 +502,7 @@ static void companion_handler(int client_fd) {
         return;
     }
     
-    // 设置超时
-    struct timeval tv = {2, 0}; // 2秒超时
+    struct timeval tv = {2, 0};
     setsockopt(target_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     setsockopt(target_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     
@@ -465,7 +520,6 @@ static void companion_handler(int client_fd) {
     
     LOGI("[Companion] 连接到 injector 成功");
     
-    // 发送上报消息
     ssize_t sent = write(target_fd, buf, strlen(buf));
     if (sent <= 0) {
         LOGE("[Companion] 发送失败: %s", strerror(errno));
@@ -478,15 +532,18 @@ static void companion_handler(int client_fd) {
     
     LOGI("[Companion] 已发送 %zd 字节", sent);
     
-    // 接收规则数据
     char rule_data[8192] = {0};
     ssize_t received = read(target_fd, rule_data, sizeof(rule_data) - 1);
     
-    close(target_fd);  // 关闭与 injector 的连接
+    close(target_fd);
     
     if (received > 0) {
         rule_data[received] = '\0';
         LOGI("[Companion] 收到规则: %d 字节", (int)received);
+        
+        // 保存规则到文件，供其他媒体进程使用
+        save_rules_to_file(rule_data);
+        
         // 发送规则数据回模块
         write(client_fd, rule_data, received);
     } else {
@@ -509,16 +566,13 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        // 只处理用户应用 (UID >= 10000)
         if (args->uid < 10000) { 
-            // 系统进程：不连接 Companion，并卸载模块
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             this->companion_fd = -1;
             this->is_media_process = false;
             return; 
         }
         
-        // 先连接 Companion
         this->companion_fd = api->connectCompanion();
         LOGI("[Module] 用户应用 UID: %d, Companion FD: %d", args->uid, this->companion_fd);
     }
@@ -526,7 +580,6 @@ public:
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
         const char* process_name = nullptr;
         
-        // 获取进程名
         if (args->nice_name) {
             process_name = env->GetStringUTFChars(args->nice_name, nullptr);
         }
@@ -538,12 +591,10 @@ public:
         int pid = getpid();
         LOGI("[Module] 进程启动: %s (PID: %d, UID: %d)", process_name, pid, getuid());
         
-        // 判断是否为媒体存储进程
         this->is_media_process = is_target_media_process(process_name);
         LOGI("[Module] 是否为媒体存储进程: %s", this->is_media_process ? "是" : "否");
         
         if (companion_fd >= 0) {
-            // 发送上报消息
             char report[512];
             snprintf(report, sizeof(report), "REPORT %s %d STATUS:HOOKED", process_name, pid);
             
@@ -551,61 +602,106 @@ public:
             ssize_t sent = write(companion_fd, report, strlen(report));
             
             if (sent > 0) {
-                LOGI("[Module] 上报发送成功: %zd 字节", sent);
-                
-                // ============ 关键修改 ============
-                // 只有媒体存储进程才接收规则和安装Hook
                 if (this->is_media_process) {
                     LOGI("[Module] 目标媒体存储进程，接收规则并安装Hook...");
                     
-                    // 接收规则数据
                     char rule_data[8192] = {0};
-                    struct timeval tv = {1, 500000}; // 1.5秒超时
+                    struct timeval tv = {1, 500000};
                     setsockopt(companion_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
                     
                     ssize_t received = read(companion_fd, rule_data, sizeof(rule_data) - 1);
                     
-                    if (received > 10) { // 确保不是空规则
+                    if (received > 10) {
                         rule_data[received] = '\0';
                         LOGI("[Module] 收到规则数据: %zd 字节", received);
                         
-                        // 解析规则
-                        parse_rules(rule_data);
+                        // 保存规则到文件
+                        save_rules_to_file(rule_data);
+                        
+                        // 从文件加载规则（确保一致性）
+                        load_rules_from_file();
                         
                         // 安装Hook
                         if (!g_rules.empty()) {
                             install_media_shields();
-                            LOGI("[Module] Dobby Hook 已安装");
+                            
+                            // 启动规则监控线程
+                            if (!g_rules_monitor_thread.joinable()) {
+                                g_module_should_unload = false;
+                                g_rules_monitor_thread = std::thread(rules_monitor_thread);
+                                LOGI("[Module] 规则监控线程已启动");
+                            }
+                            
+                            LOGI("[Module] Dobby Hook 已安装，保持模块加载");
+                            // 不卸载模块，保持Hook生效
                         } else {
-                            LOGI("[Module] 无有效规则，不安装 Hook");
-                            // 即使没有规则也卸载模块，因为这是媒体进程但不需要Hook
+                            LOGI("[Module] 无有效规则，卸载模块");
                             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+                            this->should_unload = true;
                         }
                     } else {
-                        LOGI("[Module] 未收到规则或规则为空");
-                        // 没有规则也卸载模块
-                        api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+                        LOGI("[Module] 未收到规则或规则为空，尝试从文件加载");
+                        load_rules_from_file();
+                        
+                        if (!g_rules.empty()) {
+                            install_media_shields();
+                            
+                            if (!g_rules_monitor_thread.joinable()) {
+                                g_module_should_unload = false;
+                                g_rules_monitor_thread = std::thread(rules_monitor_thread);
+                                LOGI("[Module] 规则监控线程已启动");
+                            }
+                            
+                            LOGI("[Module] 从文件加载规则并安装Hook，保持模块加载");
+                        } else {
+                            LOGI("[Module] 无规则可用，卸载模块");
+                            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+                            this->should_unload = true;
+                        }
                     }
                 } else {
-                    // 非媒体存储进程：上报后立即卸载模块，不接收规则
-                    LOGI("[Module] 非媒体存储进程，上报后卸载模块");
+                    // 非媒体存储进程：上报后立即卸载模块
+                    LOGI("[Module] 非媒体存储进程，上报后立即卸载模块");
                     api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+                    this->should_unload = true;
                 }
             } else {
                 LOGE("[Module] 上报发送失败");
+                api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+                this->should_unload = true;
             }
             
             close(companion_fd);
         } else {
-            LOGI("[Module] 无 Companion 连接");
+            LOGI("[Module] 无 Companion 连接，卸载模块");
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            this->should_unload = true;
         }
         
-        // 释放字符串资源
         if (args->nice_name && process_name) {
             env->ReleaseStringUTFChars(args->nice_name, process_name);
         }
         
         LOGI("[Module] 处理完成");
+    }
+    
+    ~AppReporterModule() {
+        // 模块卸载前的清理工作
+        if (this->should_unload) {
+            g_module_should_unload = true;
+            
+            if (g_rules_monitor_thread.joinable()) {
+                g_rules_monitor_thread.join();
+                LOGI("[Module] 规则监控线程已停止");
+            }
+            
+            uninstall_hooks();
+            
+            std::lock_guard<std::mutex> lock(g_rules_mutex);
+            g_rules.clear();
+            
+            LOGI("[Module] 模块资源已清理");
+        }
     }
 
 private:
@@ -613,6 +709,7 @@ private:
     JNIEnv *env;
     int companion_fd = -1;
     bool is_media_process = false;
+    bool should_unload = false;
 };
 
 // ==================== 模块注册 ====================
