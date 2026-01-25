@@ -242,64 +242,48 @@ public:
         api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
     }
 
-    void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        const char* process_name = nullptr;
-        if (args->nice_name) process_name = env->GetStringUTFChars(args->nice_name, nullptr);
-        if (!process_name) process_name = getprogname();
-        
-        pid_t pid = getpid();
-        LOGI("App specialized - Process: %s, PID: %d, UID: %d", 
-             process_name ? process_name : "unknown", pid, args->uid);
-        
-        // 检查是否为媒体提供者进程
-        if (process_name && strcmp(process_name, "com.android.providers.media.module") == 0) {
-            LOGI("Detected media provider process: %s (PID: %d)", process_name, pid);
-            is_media_provider = true;
-        }
-        
-        if (companion_fd >= 0) {
-            // 设置 1 秒超时强制放行
-            struct timeval tv = {1, 0};
-            if (setsockopt(companion_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-                LOGE("Failed to set socket timeout: %s", strerror(errno));
-            }
+void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
+    const char* process_name = nullptr;
+    if (args->nice_name) process_name = env->GetStringUTFChars(args->nice_name, nullptr);
+    if (!process_name) process_name = getprogname();
+    
+    pid_t pid = getpid();
 
-            char buffer[256];
-            snprintf(buffer, sizeof(buffer), "%s %d", process_name ? process_name : "unknown", pid);
-            
-            LOGI("Sending to companion: %s", buffer);
-            ssize_t write_len = write(companion_fd, buffer, strlen(buffer));
-            if (write_len != (ssize_t)strlen(buffer)) {
-                LOGE("Partial/failed write to companion: %zd/%zu, error: %s", 
-                     write_len, strlen(buffer), strerror(errno));
-            }
-            
-            char signal[32] = {0};
-            // 阻塞直到信号返回或超时
-            ssize_t read_len = read(companion_fd, signal, sizeof(signal) - 1);
-            if (read_len > 0) {
-                signal[read_len] = '\0';
-                LOGI("Received from companion: %s", signal);
-            } else if (read_len == 0) {
-                LOGE("Companion closed connection unexpectedly");
-            } else {
-                LOGE("Read from companion failed or timed out: %s", strerror(errno));
-            }
-            
-            close(companion_fd);
-            companion_fd = -1;
-        } else {
-            LOGI("No companion connection available for process: %s", 
-                 process_name ? process_name : "unknown");
-        }
+    // 1. 【彻底旁路】如果是媒体存储进程，只装 Hook，不准碰任何 IPC
+    if (process_name && (strcmp(process_name, "com.android.providers.media.module") == 0 || 
+                         strcmp(process_name, "com.android.providers.media") == 0 ||
+                         strstr(process_name, "android.process.media"))) {
         
-        // 仅在媒体提供者进程中安装 hook
-        if (is_media_provider) {
-            install_dobby_hooks();
-        }
+        LOGI("Detected critical system process: %s. Applying Dobby Hook only, bypassing IPC.", process_name);
+        install_dobby_hooks();
         
+        // 释放内存并直接返回，不再执行下面的 companion 逻辑
         if (args->nice_name && process_name) env->ReleaseStringUTFChars(args->nice_name, process_name);
+        if (companion_fd >= 0) { close(companion_fd); companion_fd = -1; }
+        return; 
     }
+
+    // 2. 对于普通 App，执行原有的逻辑
+    if (companion_fd >= 0) {
+        // 设置极短的超时，防止 injector 挂了导致 App 卡死
+        struct timeval tv = {0, 500000}; // 500ms
+        setsockopt(companion_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        char buffer[256];
+        snprintf(buffer, sizeof(buffer), "%s %d", process_name ? process_name : "unknown", pid);
+        
+        // 发送并快速读取（或者直接不读取，改为异步）
+        write(companion_fd, buffer, strlen(buffer));
+        
+        char signal[32] = {0};
+        read(companion_fd, signal, sizeof(signal) - 1); 
+        
+        close(companion_fd);
+        companion_fd = -1;
+    }
+    
+    if (args->nice_name && process_name) env->ReleaseStringUTFChars(args->nice_name, process_name);
+}
 
 private:
     zygisk::Api *api = nullptr;
