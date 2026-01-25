@@ -24,8 +24,8 @@ static const char* TARGET_SOCKET_PATH = "/data/Namespace-Proxy/ipc.sock";
 static const char* LOCK_FILE_PATH = "/data/Namespace-Proxy/app.lock";
 
 // 定义匹配基础路径（末尾不加斜杠）
-static const char* SOURCE_BASE = "/storage/emulated/0/Download/1DMP";
-static const char* TARGET_BASE = "/storage/emulated/0/Download/第三方下载/1DMP1";
+static const char* SOURCE_BASE = "";
+static const char* TARGET_BASE = "";
 
 extern "C" const char* getprogname();
 
