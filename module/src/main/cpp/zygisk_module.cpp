@@ -22,8 +22,10 @@
 
 static const char* TARGET_SOCKET_PATH = "/data/Namespace-Proxy/ipc.sock";
 static const char* LOCK_FILE_PATH = "/data/Namespace-Proxy/app.lock";
-static const char* SOURCE_PATH = "/storage/emulated/0/Download/1DMP/";
-static const char* TARGET_PATH = "/storage/emulated/0/Download/第三方下载/1DMP1/";
+
+// 注意：规则路径末尾不要写斜杠，逻辑中会自动处理边界
+static const char* SOURCE_BASE = "/storage/emulated/0/Download/1DMP";
+static const char* TARGET_BASE = "/storage/emulated/0/Download/第三方下载/1DMP1";
 
 extern "C" const char* getprogname();
 
@@ -31,23 +33,45 @@ extern "C" const char* getprogname();
 static int (*orig_openat)(int dirfd, const char *pathname, int flags, ...);
 static int (*orig_mkdirat)(int dirfd, const char *pathname, mode_t mode);
 
-// 防递归标志（重要：防止 Hook 函数内部调用系统函数导致死循环崩溃）
+// 防递归标志
 static thread_local bool g_is_hooking = false;
 
-// 路径重定向逻辑
+// 路径重定向逻辑：末尾是否有斜杠都视为同一个
 static char* redirect_path(const char *orig_path) {
     if (!orig_path || orig_path[0] != '/') return nullptr;
-    if (strncmp(orig_path, SOURCE_PATH, strlen(SOURCE_PATH)) != 0) return nullptr;
-    
-    size_t suffix_len = strlen(orig_path) - strlen(SOURCE_PATH);
-    size_t new_len = strlen(TARGET_PATH) + suffix_len + 1;
-    if (new_len > PATH_MAX) return nullptr;
-    
-    char *new_path = (char*)malloc(new_len);
-    if (!new_path) return nullptr;
-    
-    snprintf(new_path, new_len, "%s%s", TARGET_PATH, orig_path + strlen(SOURCE_PATH));
-    return new_path;
+
+    // 1. 复制一份路径用于规范化处理
+    char temp_path[PATH_MAX];
+    strncpy(temp_path, orig_path, PATH_MAX - 1);
+    temp_path[PATH_MAX - 1] = '\0';
+
+    // 2. 去掉末尾斜杠 (例如 /abc/ -> /abc)
+    size_t len = strlen(temp_path);
+    while (len > 1 && temp_path[len - 1] == '/') {
+        temp_path[len - 1] = '\0';
+        len--;
+    }
+
+    size_t src_len = strlen(SOURCE_BASE);
+
+    // 情况 A: 路径完全匹配父目录 (去掉斜杠后一致)
+    if (strcmp(temp_path, SOURCE_BASE) == 0) {
+        return strdup(TARGET_BASE);
+    }
+
+    // 情况 B: 路径是子目录或子文件 (例如 /SOURCE_BASE/file)
+    // 检查是否以 SOURCE_BASE/ 为前缀
+    if (strncmp(temp_path, SOURCE_BASE, src_len) == 0 && temp_path[src_len] == '/') {
+        const char* suffix = temp_path + src_len; // 包含领头的斜杠
+        size_t target_len = strlen(TARGET_BASE) + strlen(suffix) + 1;
+        char* new_path = (char*)malloc(target_len);
+        if (new_path) {
+            snprintf(new_path, target_len, "%s%s", TARGET_BASE, suffix);
+        }
+        return new_path;
+    }
+
+    return nullptr;
 }
 
 // Hook 实现
@@ -66,7 +90,7 @@ static int fake_openat(int dirfd, const char *pathname, int flags, ...) {
     int res;
     char *new_path = redirect_path(pathname);
     if (new_path) {
-        LOGI("[Redirect] openat: %s", new_path);
+        LOGI("[Redirect] openat: %s -> %s", pathname, new_path);
         res = (flags & O_CREAT) ? orig_openat(dirfd, new_path, flags, mode) : orig_openat(dirfd, new_path, flags);
         free(new_path);
     } else {
@@ -83,7 +107,7 @@ static int fake_mkdirat(int dirfd, const char *pathname, mode_t mode) {
     int res;
     char *new_path = redirect_path(pathname);
     if (new_path) {
-        LOGI("[Redirect] mkdirat: %s", new_path);
+        LOGI("[Redirect] mkdirat: %s -> %s", pathname, new_path);
         res = orig_mkdirat(dirfd, new_path, mode);
         free(new_path);
     } else {
@@ -94,7 +118,7 @@ static int fake_mkdirat(int dirfd, const char *pathname, mode_t mode) {
 }
 
 static void install_hooks() {
-    LOGI("Installing MediaProvider hooks...");
+    LOGI("Installing MediaProvider hooks (Normalized Path Mode)...");
     void *handle = dlopen("libc.so", RTLD_NOW);
     if (!handle) return;
     
@@ -105,7 +129,6 @@ static void install_hooks() {
     if (mkdirat_ptr) DobbyHook(mkdirat_ptr, (dobby_dummy_func_t)fake_mkdirat, (dobby_dummy_func_t*)&orig_mkdirat);
     
     dlclose(handle);
-    LOGI("Hooks installed successfully.");
 }
 
 // Companion 处理
@@ -119,15 +142,13 @@ static void companion_handler(int client_fd) {
     buffer[read_len] = '\0';
 
     if (access(LOCK_FILE_PATH, F_OK) != 0) {
-        write(client_fd, "SKIP_NO_LOCK", 12);
         close(client_fd);
         return;
     }
 
-    // 满足条件 3: 添加 SOCK_CLOEXEC
+    // 满足条件 3: 使用 SOCK_CLOEXEC
     int target_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (target_fd < 0) {
-        write(client_fd, "ERR_SOCK", 8);
         close(client_fd);
         return;
     }
@@ -137,21 +158,18 @@ static void companion_handler(int client_fd) {
 
     if (connect(target_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         close(target_fd);
-        write(client_fd, "ERR_CONN", 8);
         close(client_fd);
         return;
     }
 
-    // 转发给 Injector 进程
     write(target_fd, buffer, strlen(buffer));
     
-    // 等待简单 ACK 确保 Injector 已接收
-    struct timeval tv = {0, 500000}; // 500ms 超时
+    // 等待 ACK 确保同步
+    struct timeval tv = {0, 500000}; 
     setsockopt(target_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     char ack[8] = {0};
     read(target_fd, ack, sizeof(ack) - 1);
     
-    // 回复 Zygisk Module
     write(client_fd, "OK", 2);
 
     close(target_fd);
@@ -172,7 +190,7 @@ public:
             return;
         }
         
-        // 满足条件 2: 移除强制卸载和库卸载选项
+        // 满足条件 2: 不设置 FORCE_DENYLIST_UNMOUNT / DLCLOSE
         this->companion_fd = api->connectCompanion();
     }
 
@@ -183,7 +201,7 @@ public:
         
         pid_t pid = getpid();
 
-        // 特殊进程判断
+        // 识别媒体核心进程
         bool is_media = (process_name && (
             strcmp(process_name, "com.android.providers.media.module") == 0 || 
             strcmp(process_name, "com.android.providers.media") == 0 ||
@@ -191,22 +209,19 @@ public:
         ));
 
         if (is_media) {
-            LOGI("Media process specialized: %s (PID: %d). Installing Hook, bypassing IPC.", process_name, pid);
+            LOGI("Media process specialized: %s (PID: %d). Installing Path-Normalized Hook.", process_name, pid);
             install_hooks();
             
-            // 如果是 media 进程，即使 UID > 10000 也要关闭 IPC 通信防止干扰启动
             if (companion_fd >= 0) {
                 close(companion_fd);
                 companion_fd = -1;
             }
         } else if (companion_fd >= 0) {
-            // 普通 App 上报
             char buffer[256];
             snprintf(buffer, sizeof(buffer), "%s %d", process_name ? process_name : "unknown", pid);
             
             write(companion_fd, buffer, strlen(buffer));
             
-            // 等待反馈防止 Socket 过早关闭导致的 Bad File Descriptor
             struct timeval tv = {0, 300000}; 
             setsockopt(companion_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             char ack[8] = {0};
