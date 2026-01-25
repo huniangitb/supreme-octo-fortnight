@@ -1,58 +1,45 @@
+#include <android/log.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/time.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cstdio>
 #include <cstring>
-#include <cstdarg>
-#include <fcntl.h>
-#include <dlfcn.h>
+#include <cerrno>
 #include <vector>
 #include <string>
 #include <mutex>
-#include <thread>
 #include <atomic>
-#include <android/log.h>
-#include <cerrno>
-#include <poll.h>
 
 #include "zygisk.hpp"
 #include "dobby.h"
 
 #define LOG_TAG "Zygisk_NSProxy"
-#define TARGET_SOCKET_PATH "/data/Namespace-Proxy/ipc.sock"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// --- 全局状态 ---
+static const char* TARGET_SOCKET_PATH = "/data/Namespace-Proxy/ipc.sock";
+static const char* LOCK_FILE_PATH = "/data/Namespace-Proxy/app.lock";
+
+// --- 全局变量 ---
 static std::vector<std::string> g_block_rules;
 static std::mutex g_rule_mutex;
-static zygisk::Api* g_api = nullptr;
-static bool g_is_media_process = false;
-static char g_process_name[256] = {"unknown"};
 static std::atomic<bool> g_hooks_active(false);
+static char g_process_name[256] = {"unknown"};
 
-// --- 原始函数指针 (由 Dobby 回填) ---
+// --- 原始函数指针 ---
 static int (*orig_openat)(int, const char*, int, mode_t) = nullptr;
 static int (*orig_mkdirat)(int, const char*, mode_t) = nullptr;
 
-// --- 日志系统 ---
-static void z_log(const char* fmt, ...) {
-    char msg[1024];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, args);
-    va_end(args);
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "[%d][%s] %s", getpid(), g_process_name, msg);
-}
-
 // --- 路径拦截逻辑 ---
 static bool is_path_blocked(const char* path) {
-    if (!path) return false;
+    if (!path || !g_hooks_active) return false;
     
-    // 硬编码规则
+    // 基础硬编码逻辑
     if (strstr(path, "/storage/emulated/0/Download/1DMP")) return true;
     
-    // 动态规则
-    if (g_block_rules.empty()) return false;
+    // 动态规则匹配
     std::lock_guard<std::mutex> lock(g_rule_mutex);
     for (const auto& prefix : g_block_rules) {
         if (strstr(path, prefix.c_str())) return true;
@@ -60,10 +47,10 @@ static bool is_path_blocked(const char* path) {
     return false;
 }
 
-// --- 代理函数 (Proxy Functions) ---
+// --- Hook 代理函数 ---
 int my_openat(int fd, const char* path, int flags, mode_t mode) {
-    if (g_hooks_active && is_path_blocked(path)) {
-        z_log("BLOCKED openat: %s", path);
+    if (is_path_blocked(path)) {
+        LOGI("已拦截 openat: %s", path);
         errno = ENOENT;
         return -1;
     }
@@ -71,235 +58,166 @@ int my_openat(int fd, const char* path, int flags, mode_t mode) {
 }
 
 int my_mkdirat(int fd, const char* path, mode_t mode) {
-    if (g_hooks_active && is_path_blocked(path)) {
-        z_log("BLOCKED mkdirat: %s", path);
+    if (is_path_blocked(path)) {
+        LOGI("已拦截 mkdirat: %s", path);
         errno = EACCES;
         return -1;
     }
     return orig_mkdirat(fd, path, mode);
 }
 
-// --- Hook 安装逻辑 (Dobby) ---
+// --- Dobby 安装逻辑 ---
 static bool install_hooks() {
-    z_log("正在使用 Dobby 初始化 Hooks...");
-
     void* sym_openat = DobbySymbolResolver("libc.so", "openat");
     void* sym_mkdirat = DobbySymbolResolver("libc.so", "mkdirat");
 
     if (!sym_openat || !sym_mkdirat) {
-        if (!sym_openat) sym_openat = DobbySymbolResolver(nullptr, "openat");
-        if (!sym_mkdirat) sym_mkdirat = DobbySymbolResolver(nullptr, "mkdirat");
+        sym_openat = DobbySymbolResolver(nullptr, "openat");
+        sym_mkdirat = DobbySymbolResolver(nullptr, "mkdirat");
     }
 
-    if (!sym_openat || !sym_mkdirat) {
-        z_log("致命错误：无法解析 openat 或 mkdirat 符号地址");
-        return false;
-    }
+    if (!sym_openat || !sym_mkdirat) return false;
 
-    int ret_open = DobbyHook(sym_openat, (dobby_dummy_func_t)my_openat, (dobby_dummy_func_t*)&orig_openat);
-    int ret_mkdir = DobbyHook(sym_mkdirat, (dobby_dummy_func_t)my_mkdirat, (dobby_dummy_func_t*)&orig_mkdirat);
-
-    if (ret_open == 0 && ret_mkdir == 0) {
-        z_log("Dobby Hook 安装成功！");
-        return true;
-    } else {
-        z_log("Dobby Hook 安装失败: open_ret=%d, mkdir_ret=%d", ret_open, ret_mkdir);
-        return false;
-    }
+    DobbyHook(sym_openat, (dobby_dummy_func_t)my_openat, (dobby_dummy_func_t*)&orig_openat);
+    DobbyHook(sym_mkdirat, (dobby_dummy_func_t)my_mkdirat, (dobby_dummy_func_t*)&orig_mkdirat);
+    
+    return true;
 }
 
-// --- 媒体存储设备：直接连接到后端服务 ---
-static void setup_media_process() {
-    z_log("开始设置媒体存储设备进程");
-    
-    // 直接连接到后端服务
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) {
-        z_log("创建socket失败: %s", strerror(errno));
-        return;
-    }
-    
-    struct sockaddr_un addr = {0};
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, TARGET_SOCKET_PATH, sizeof(addr.sun_path)-1);
-    
-    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        z_log("连接后端服务失败: %s", strerror(errno));
-        close(fd);
-        return;
-    }
-    
-    // 发送REPORT消息
-    char report[256];
-    snprintf(report, sizeof(report), "REPORT %s %d STATUS:HOOKED", g_process_name, getpid());
-    if (write(fd, report, strlen(report)) <= 0) {
-        z_log("发送REPORT失败: %s", strerror(errno));
-        close(fd);
-        return;
-    }
-    
-    z_log("成功发送REPORT到后端服务");
-    
-    // 读取规则
-    char buf[8192];
-    ssize_t len = read(fd, buf, sizeof(buf) - 1);
-    if (len > 0) {
-        buf[len] = 0;
-        if (strncmp(buf, "SET_RULES:", 10) == 0) {
-            std::lock_guard<std::mutex> lock(g_rule_mutex);
-            g_block_rules.clear();
-            char* data = buf + 10;
-            char* token = strtok(data, ",");
-            while (token) {
-                if (*token) g_block_rules.emplace_back(token);
-                token = strtok(nullptr, ",");
-            }
-            z_log("规则更新: %zu 条", g_block_rules.size());
-        }
-    }
-    
-    close(fd);
-    
-    // 安装Hook（阻塞执行）
-    if (install_hooks()) {
-        g_hooks_active = true;
-        z_log("媒体存储设备Hook已激活");
-    }
-}
-
-// --- 普通应用：通过Companion汇报 ---
-static void setup_normal_process() {
-    z_log("开始设置普通应用进程");
-    
-    // 通过Companion汇报
-    int fd = g_api->connectCompanion();
-    if (fd < 0) {
-        z_log("连接到Companion失败");
-        return;
-    }
-    
-    // 发送进程名称和PID
-    char report[256];
-    snprintf(report, sizeof(report), "%s %d", g_process_name, getpid());
-    
-    if (write(fd, report, strlen(report)) > 0) {
-        z_log("成功发送进程信息到Companion");
-        
-        // 等待响应
-        char response[64];
-        ssize_t n = read(fd, response, sizeof(response)-1);
-        if (n > 0) {
-            response[n] = 0;
-            z_log("Companion响应: %s", response);
-        }
-    } else {
-        z_log("发送进程信息失败: %s", strerror(errno));
-    }
-    
-    close(fd);
-}
-
-// --- Companion 逻辑（退回到旧式通讯）---
+// --- Companion 处理逻辑 (运行在 Root 权限) ---
 static void companion_handler(int client_fd) {
-    char buf[256] = {0};
-    ssize_t n = read(client_fd, buf, sizeof(buf)-1);
-    
+    char buffer[8192] = {0}; // 调大缓冲区以接收长规则
+    ssize_t n = read(client_fd, buffer, sizeof(buffer) - 1);
     if (n <= 0) {
         close(client_fd);
         return;
     }
-    
-    buf[n] = 0;
-    
-    // 连接到后端服务
-    int backend_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (backend_fd < 0) {
-        write(client_fd, "ERR:创建socket失败", 18);
+
+    // 1. 检查后端锁文件，防止无效连接
+    if (access(LOCK_FILE_PATH, F_OK) != 0) {
+        write(client_fd, "ERR_NO_BACKEND", 14);
         close(client_fd);
         return;
     }
-    
-    struct sockaddr_un addr = {0};
+
+    // 2. 连接后端实际的 Socket
+    int target_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (target_fd < 0) {
+        write(client_fd, "ERR_SOCKET_FAIL", 15);
+        close(client_fd);
+        return;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, TARGET_SOCKET_PATH, sizeof(addr.sun_path)-1);
-    
-    if (connect(backend_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        write(client_fd, "ERR:后端连接失败", 16);
-        close(backend_fd);
+    strncpy(addr.sun_path, TARGET_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+    if (connect(target_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(target_fd);
+        write(client_fd, "ERR_CONN_BACKEND", 16);
         close(client_fd);
         return;
     }
+
+    // 3. 转发 App 消息给后端 (例如 "REPORT pkg pid STATUS:HOOKED")
+    write(target_fd, buffer, strlen(buffer));
     
-    // 转发消息到后端
-    if (write(backend_fd, buf, strlen(buf)) <= 0) {
-        write(client_fd, "ERR:转发失败", 13);
-        close(backend_fd);
-        close(client_fd);
-        return;
-    }
+    // 4. 读取后端返回的内容 (可能是 "OK" 或 "SET_RULES:...")
+    char backend_resp[8192] = {0};
+    struct timeval tv = {2, 0}; // 2秒超时
+    setsockopt(target_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     
-    // 读取后端响应
-    char response[64];
-    ssize_t resp_len = read(backend_fd, response, sizeof(response)-1);
+    ssize_t resp_len = read(target_fd, backend_resp, sizeof(backend_resp) - 1);
     if (resp_len > 0) {
-        response[resp_len] = 0;
-        write(client_fd, response, resp_len);
+        // 5. 将结果回传给 App 进程
+        write(client_fd, backend_resp, resp_len);
     } else {
-        write(client_fd, "OK", 2);
+        write(client_fd, "OK_TIMEOUT", 10);
     }
-    
-    close(backend_fd);
+
+    close(target_fd);
     close(client_fd);
 }
 
-// --- Zygisk 模块入口 ---
+// --- Zygisk 模块主体 ---
 class MediaTargetModule : public zygisk::ModuleBase {
 public:
-    void onLoad(zygisk::Api *api, JNIEnv *env) override { 
-        g_api = api; 
-        this->env = env; 
+    void onLoad(zygisk::Api *api, JNIEnv *env) override {
+        this->api = api;
+        this->env = env;
     }
-    
+
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+        // 过滤系统核心进程
+        if (args->uid < 1000) return;
+
         const char* nice_name = nullptr;
         if (args->nice_name) nice_name = env->GetStringUTFChars(args->nice_name, nullptr);
         
         if (nice_name) {
-            strncpy(g_process_name, nice_name, sizeof(g_process_name)-1);
-            
-            // 检查是否是媒体存储设备
+            strncpy(g_process_name, nice_name, sizeof(g_process_name) - 1);
+            // 识别媒体存储进程
             if (strstr(nice_name, "android.providers.media") || 
                 strstr(nice_name, "android.process.media") ||
-                strcmp(nice_name, "com.android.providers.media.module") == 0 ||
                 strstr(nice_name, "com.google.android.providers.media")) {
-                g_is_media_process = true;
+                is_media_provider = true;
             }
-            
             env->ReleaseStringUTFChars(args->nice_name, nice_name);
         }
+
+        api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
     }
-    
+
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        // 记录进程信息
-        __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "进程注入: PID=%d, 名称=%s", getpid(), g_process_name);
-        
-        // 阻塞执行进程设置
-        if (g_is_media_process) {
-            __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "媒体存储设备进程 - 开始设置");
-            setup_media_process();
-            __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "媒体存储设备进程 - 设置完成");
+        int fd = api->connectCompanion();
+        if (fd < 0) return;
+
+        // 设置通讯超时
+        struct timeval tv = {2, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        char msg[512];
+        if (is_media_provider) {
+            // Media Provider 请求规则并上报
+            snprintf(msg, sizeof(msg), "REPORT %s %d STATUS:HOOKED", g_process_name, getpid());
         } else {
-            __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "普通应用进程 - 开始汇报");
-            setup_normal_process();
-            __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "普通应用进程 - 汇报完成");
+            // 普通应用仅上报，供后端执行 FUSE 注入
+            snprintf(msg, sizeof(msg), "%s %d", g_process_name, getpid());
+        }
+
+        write(fd, msg, strlen(msg));
+
+        // 接收来自 Companion (后端) 的指令
+        char response[8192] = {0};
+        ssize_t len = read(fd, response, sizeof(response) - 1);
+        
+        if (len > 0 && is_media_provider) {
+            if (strncmp(response, "SET_RULES:", 10) == 0) {
+                // 解析拦截规则
+                std::lock_guard<std::mutex> lock(g_rule_mutex);
+                char* data = response + 10;
+                char* token = strtok(data, ",");
+                while (token) {
+                    if (*token) g_block_rules.emplace_back(token);
+                    token = strtok(nullptr, ",");
+                }
+                
+                // 激活 Hook
+                if (install_hooks()) {
+                    g_hooks_active = true;
+                    LOGI("媒体进程 Hook 注入成功，加载规则: %zu 条", g_block_rules.size());
+                }
+            }
         }
         
-        // 关闭模块库
-        g_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+        close(fd);
     }
-    
+
 private:
+    zygisk::Api *api;
     JNIEnv *env;
+    bool is_media_provider = false;
 };
 
 REGISTER_ZYGISK_MODULE(MediaTargetModule)
