@@ -179,24 +179,69 @@ static void parse_rules(const char* data) {
 
 static void companion_handler(int client_fd) {
     char buf[256];
-    if (read(client_fd, buf, sizeof(buf)-1) <= 0) { close(client_fd); return; }
+    ssize_t len = read(client_fd, buf, sizeof(buf)-1);
+    if (len <= 0) { 
+        close(client_fd); 
+        return; 
+    }
+    buf[len] = '\0';
     
-    if (access(LOCK_FILE_PATH, F_OK) != 0) { write(client_fd, "ERR_LOCK", 8); close(client_fd); return; }
+    // 检查锁文件
+    if (access(LOCK_FILE_PATH, F_OK) != 0) { 
+        write(client_fd, "ERR_LOCK", 8); 
+        close(client_fd); 
+        return; 
+    }
 
+    // 连接到 injector
     int target_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (target_fd < 0) {
+        close(client_fd);
+        return;
+    }
+    
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     strncpy(addr.sun_path, TARGET_SOCKET_PATH, sizeof(addr.sun_path)-1);
-
-    if (connect(target_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-        write(target_fd, buf, strlen(buf));
-        char resp[8192] = {0};
-        struct timeval tv = {2, 0};
-        setsockopt(target_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        if (read(target_fd, resp, sizeof(resp)-1) > 0) {
-            write(client_fd, resp, strlen(resp)); // 把 SET_RULES 传回模块
-        }
+    
+    // 设置连接超时
+    struct timeval tv = {2, 0};
+    setsockopt(target_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(target_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    if (connect(target_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        LOGI("[Zygisk] 无法连接到 injector: %s", strerror(errno));
+        close(target_fd);
+        close(client_fd);
+        return;
     }
-    close(target_fd); close(client_fd);
+    
+    // 发送上报消息
+    ssize_t sent = write(target_fd, buf, strlen(buf));
+    if (sent <= 0) {
+        LOGI("[Zygisk] 发送失败");
+        close(target_fd);
+        close(client_fd);
+        return;
+    }
+    
+    // 接收规则数据
+    char rule_data[8192] = {0};
+    ssize_t received = read(target_fd, rule_data, sizeof(rule_data)-1);
+    
+    close(target_fd);  // 关闭连接
+    
+    if (received > 0) {
+        rule_data[received] = '\0';
+        LOGI("[Zygisk] 收到规则: %d 字节", (int)received);
+        // 发送规则数据回模块
+        write(client_fd, rule_data, received);
+    } else {
+        LOGI("[Zygisk] 未收到规则数据");
+        // 发送空响应
+        write(client_fd, "SET_RULES:", 10);
+    }
+    
+    close(client_fd);
 }
 
 class AppReporterModule : public zygisk::ModuleBase {
@@ -209,34 +254,52 @@ public:
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        const char* process_name = nullptr;
-        if (args->nice_name) process_name = env->GetStringUTFChars(args->nice_name, nullptr);
-        if (!process_name) process_name = "unknown";
+    const char* process_name = nullptr;
+    if (args->nice_name) process_name = env->GetStringUTFChars(args->nice_name, nullptr);
+    if (!process_name) process_name = "unknown";
+    
+    LOGI("[Zygisk] 进程启动: %s (PID: %d)", process_name, getpid());
+    
+    if (companion_fd >= 0) {
+        char report[512];
+        snprintf(report, sizeof(report), "REPORT %s %d STATUS:HOOKED", process_name, getpid());
         
-        if (companion_fd >= 0) {
-            char report[512];
-            snprintf(report, sizeof(report), "REPORT %s %d STATUS:HOOKED", process_name, getpid());
-            write(companion_fd, report, strlen(report));
-            
-            char rule_data[8192] = {0};
-            struct timeval tv = {1, 500000};
-            setsockopt(companion_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            if (read(companion_fd, rule_data, sizeof(rule_data)-1) > 0) {
-                parse_rules(rule_data);
-            }
-            close(companion_fd);
+        // 发送上报
+        write(companion_fd, report, strlen(report));
+        LOGI("[Zygisk] 已发送上报: %s", report);
+        
+        // 接收规则
+        char rule_data[8192] = {0};
+        struct timeval tv = {1, 500000};
+        setsockopt(companion_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        
+        ssize_t received = read(companion_fd, rule_data, sizeof(rule_data)-1);
+        if (received > 0) {
+            rule_data[received] = '\0';
+            LOGI("[Zygisk] 收到规则数据: %d 字节", (int)received);
+            parse_rules(rule_data);
+        } else {
+            LOGI("[Zygisk] 未收到规则数据，使用空规则");
         }
-
-        bool is_media = (strstr(process_name, "com.android.providers.media") || strstr(process_name, "android.process.media"));
-        if (is_media && !g_rules.empty()) {
-            LOGI("System Media Process Detected. Installing Shield.");
-            void *h = dlopen("libc.so", RTLD_NOW);
-            #define HOOK(n) void* p_##n = dlsym(h, #n); if(p_##n) DobbyHook(p_##n, (dobby_dummy_func_t)fake_##n, (dobby_dummy_func_t*)&orig_##n)
-            HOOK(openat); HOOK(mkdirat); HOOK(faccessat); HOOK(fstatat); HOOK(getdents64);
-            dlclose(h);
-        }
-        if (args->nice_name && process_name) env->ReleaseStringUTFChars(args->nice_name, process_name);
+        close(companion_fd);
+    } else {
+        LOGI("[Zygisk] 无 companion 连接");
     }
+
+    // 决定是否安装钩子
+    bool is_media = (strstr(process_name, "com.android.providers.media") || 
+                     strstr(process_name, "android.process.media"));
+    if (is_media && !g_rules.empty()) {
+        LOGI("System Media Process Detected. Installing Shield. 规则数量: %zu", g_rules.size());
+        void *h = dlopen("libc.so", RTLD_NOW);
+        #define HOOK(n) void* p_##n = dlsym(h, #n); if(p_##n) DobbyHook(p_##n, (dobby_dummy_func_t)fake_##n, (dobby_dummy_func_t*)&orig_##n)
+        HOOK(openat); HOOK(mkdirat); HOOK(faccessat); HOOK(fstatat); HOOK(getdents64);
+        dlclose(h);
+    }
+    
+    if (args->nice_name && process_name) 
+        env->ReleaseStringUTFChars(args->nice_name, process_name);
+}
 private:
     zygisk::Api *api; JNIEnv *env; int companion_fd;
 };
