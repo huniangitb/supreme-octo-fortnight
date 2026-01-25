@@ -12,6 +12,7 @@
 #include <linux/limits.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <pthread.h> // 引入 pthread
 
 #include "zygisk.hpp"
 #include "dobby.h"
@@ -32,6 +33,9 @@ extern "C" const char* getprogname();
 static int (*orig_openat)(int dirfd, const char *pathname, int flags, ...);
 static int (*orig_mkdirat)(int dirfd, const char *pathname, mode_t mode);
 
+// 防递归标志：每个线程独立
+static thread_local bool g_is_hooking = false;
+
 // 仅在媒体提供者进程中安装 hook
 static bool is_media_provider = false;
 
@@ -44,30 +48,23 @@ static char* redirect_path(const char *orig_path) {
         return nullptr;
     }
     
-    // 计算新路径长度 (目标路径 + 剩余部分 + 终止符)
+    // 计算新路径长度
     size_t suffix_len = strlen(orig_path) - strlen(SOURCE_PATH);
     size_t new_len = strlen(TARGET_PATH) + suffix_len + 1;
     
-    // 路径过长保护
-    if (new_len > PATH_MAX) {
-        LOGE("Redirect path too long: %s", orig_path);
-        return nullptr;
-    }
+    if (new_len > PATH_MAX) return nullptr;
     
     char *new_path = (char*)malloc(new_len);
-    if (!new_path) {
-        LOGE("Memory allocation failed for new path");
-        return nullptr;
-    }
+    if (!new_path) return nullptr;
     
-    // 构造新路径
     snprintf(new_path, new_len, "%s%s", TARGET_PATH, orig_path + strlen(SOURCE_PATH));
-    LOGI("Redirected: %s -> %s", orig_path, new_path);
+    // 注意：在这里打印日志可能是安全的，但也建议尽量减少
     return new_path;
 }
 
 // Hook openat 函数
 static int fake_openat(int dirfd, const char *pathname, int flags, ...) {
+    // 1. 获取可变参数 mode
     va_list ap;
     va_start(ap, flags);
     mode_t mode = 0;
@@ -76,144 +73,123 @@ static int fake_openat(int dirfd, const char *pathname, int flags, ...) {
     }
     va_end(ap);
 
-    char *new_path = redirect_path(pathname);
+    // 2. 防递归检查：如果当前线程正在执行 Hook 逻辑，直接调用原函数
+    if (g_is_hooking) {
+        if (flags & O_CREAT) return orig_openat(dirfd, pathname, flags, mode);
+        return orig_openat(dirfd, pathname, flags);
+    }
+
+    // 3. 标记进入 Hook
+    g_is_hooking = true;
+    
     int res;
+    char *new_path = redirect_path(pathname);
     
     if (new_path) {
+        LOGI("[Redirect] openat: %s -> %s", pathname, new_path);
         if (flags & O_CREAT) {
             res = orig_openat(dirfd, new_path, flags, mode);
         } else {
             res = orig_openat(dirfd, new_path, flags);
         }
         free(new_path);
-        return res;
+    } else {
+        // 未匹配路径
+        if (flags & O_CREAT) {
+            res = orig_openat(dirfd, pathname, flags, mode);
+        } else {
+            res = orig_openat(dirfd, pathname, flags);
+        }
     }
-    
-    // 未匹配路径，调用原始函数
-    if (flags & O_CREAT) {
-        return orig_openat(dirfd, pathname, flags, mode);
-    }
-    return orig_openat(dirfd, pathname, flags);
+
+    // 4. 标记退出 Hook
+    g_is_hooking = false;
+    return res;
 }
 
 // Hook mkdirat 函数
 static int fake_mkdirat(int dirfd, const char *pathname, mode_t mode) {
+    if (g_is_hooking) return orig_mkdirat(dirfd, pathname, mode);
+
+    g_is_hooking = true;
+    
+    int res;
     char *new_path = redirect_path(pathname);
     if (new_path) {
-        int res = orig_mkdirat(dirfd, new_path, mode);
+        LOGI("[Redirect] mkdirat: %s -> %s", pathname, new_path);
+        res = orig_mkdirat(dirfd, new_path, mode);
         free(new_path);
-        return res;
+    } else {
+        res = orig_mkdirat(dirfd, pathname, mode);
     }
-    return orig_mkdirat(dirfd, pathname, mode);
+    
+    g_is_hooking = false;
+    return res;
 }
 
-// 安装 Dobby Hook
 static void install_dobby_hooks() {
-    LOGI("Installing Dobby hooks for media provider");
-    
-    // 获取 libc 句柄
+    LOGI("Installing Dobby hooks (Protected)...");
     void *libc_handle = dlopen("libc.so", RTLD_NOW);
-    if (!libc_handle) {
-        LOGE("Failed to open libc: %s", dlerror());
-        return;
-    }
+    if (!libc_handle) return;
     
-    // 解析 openat
     void *openat_addr = dlsym(libc_handle, "openat");
     if (openat_addr) {
-        if (DobbyHook(openat_addr, (dobby_dummy_func_t)fake_openat, (dobby_dummy_func_t*)&orig_openat) != 0) {
-            LOGE("Failed to hook openat");
-        } else {
-            LOGI("Successfully hooked openat");
-        }
-    } else {
-        LOGE("openat not found: %s", dlerror());
+        DobbyHook(openat_addr, (dobby_dummy_func_t)fake_openat, (dobby_dummy_func_t*)&orig_openat);
     }
     
-    // 解析 mkdirat
     void *mkdirat_addr = dlsym(libc_handle, "mkdirat");
     if (mkdirat_addr) {
-        if (DobbyHook(mkdirat_addr, (dobby_dummy_func_t)fake_mkdirat, (dobby_dummy_func_t*)&orig_mkdirat) != 0) {
-            LOGE("Failed to hook mkdirat");
-        } else {
-            LOGI("Successfully hooked mkdirat");
-        }
-    } else {
-        LOGE("mkdirat not found: %s", dlerror());
+        DobbyHook(mkdirat_addr, (dobby_dummy_func_t)fake_mkdirat, (dobby_dummy_func_t*)&orig_mkdirat);
     }
-    
     dlclose(libc_handle);
 }
 
 static void companion_handler(int client_fd) {
-    auto send_and_close = [&](const char* msg) {
-        write(client_fd, msg, strlen(msg));
-        close(client_fd);
-    };
-
     char buffer[256] = {0};
     ssize_t read_len = read(client_fd, buffer, sizeof(buffer) - 1);
     if (read_len <= 0) {
-        LOGE("Read from client failed: %s", strerror(errno));
         close(client_fd);
-        return;
+        return; // 客户端关闭或错误，直接结束，不打印 Error 以减少噪音
     }
     buffer[read_len] = '\0';
 
-    LOGI("Received from app: %s", buffer);
-
     // 检查锁文件
     if (access(LOCK_FILE_PATH, F_OK) != 0) {
-        LOGI("Lock file not found, skipping hook");
-        send_and_close("SKIP_NO_LOCK");
+        write(client_fd, "SKIP", 4); 
+        close(client_fd);
         return;
     }
 
     int target_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (target_fd < 0) {
-        LOGE("Socket creation failed: %s", strerror(errno));
-        send_and_close("ERR_SOCKET_CREATE");
+        close(client_fd);
         return;
     }
 
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
+    struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, TARGET_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
     if (connect(target_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        LOGE("Connection to backend failed: %s", strerror(errno));
         close(target_fd);
-        send_and_close("ERR_PROXY_CONN");
+        close(client_fd);
         return;
     }
 
-    LOGI("Successfully connected to backend socket");
-
-    ssize_t write_len = write(target_fd, buffer, strlen(buffer));
-    if (write_len != (ssize_t)strlen(buffer)) {
-        LOGE("Partial/failed write to backend: %zd/%zu", write_len, strlen(buffer));
-    } else {
-        LOGI("Successfully sent data to backend");
-    }
+    // 转发给 Injector
+    write(target_fd, buffer, strlen(buffer));
     
-    char ack[16] = {0};
-    struct timeval tv = {1, 0};
+    // 等待 Injector 简单回复 (避免阻塞太久)
+    struct timeval tv = {1, 0}; // 1秒超时
     setsockopt(target_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char ack[16] = {0};
+    read(target_fd, ack, sizeof(ack) - 1);
     
-    ssize_t ack_len = read(target_fd, ack, sizeof(ack) - 1);
-    if (ack_len > 0) {
-        ack[ack_len] = '\0';
-        LOGI("Received response from backend: %s", ack);
-        write(client_fd, ack, ack_len);
-    } else {
-        LOGE("Read from backend failed or timed out: %s", strerror(errno));
-        write(client_fd, "OK_TIMEOUT", 10);
-    }
+    // 回复 App (让 App 知道流程结束，可以关闭 Socket 了)
+    write(client_fd, "OK", 2);
 
     close(target_fd);
     close(client_fd);
-    LOGI("Companion handler completed");
 }
 
 class AppReporterModule : public zygisk::ModuleBase {
@@ -221,69 +197,65 @@ public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
         this->api = api;
         this->env = env;
-        LOGI("Module loaded successfully");
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        // 过滤 UID < 1001 的系统应用
-        if (args->uid < 1001) {
-            LOGI("Skipping system app with UID: %d", args->uid);
-            this->companion_fd = -1;
+        // 过滤系统应用 (UID < 10000 往往是系统服务，除了 media 相关的)
+        if (args->uid < 1000) return;
+        
+        // 提前连接 Companion
+        this->companion_fd = api->connectCompanion();
+    }
+
+    void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
+        const char* process_name = nullptr;
+        if (args->nice_name) process_name = env->GetStringUTFChars(args->nice_name, nullptr);
+        if (!process_name) process_name = getprogname();
+        
+        pid_t pid = getpid();
+        
+        // --- 核心修复：针对 Media Provider 的处理 ---
+        bool is_media = (process_name && (
+            strcmp(process_name, "com.android.providers.media.module") == 0 || 
+            strcmp(process_name, "com.android.providers.media") == 0 ||
+            strstr(process_name, "android.process.media")
+        ));
+
+        if (is_media) {
+            LOGI("System Process Detected: %s (PID %d). Hooking ONLY, No IPC.", process_name, pid);
+            install_dobby_hooks(); // 安装带防递归保护的 Hook
+            
+            // 立即关闭 Companion 连接，绝对不发送数据
+            if (companion_fd >= 0) {
+                close(companion_fd);
+                companion_fd = -1;
+            }
+            if (args->nice_name && process_name) env->ReleaseStringUTFChars(args->nice_name, process_name);
             return;
         }
         
-        LOGI("Connecting to companion for UID: %d", args->uid);
-        this->companion_fd = api->connectCompanion();
-        if (companion_fd < 0) {
-            LOGE("Failed to connect to companion");
+        // --- 普通 App 处理逻辑 ---
+        if (companion_fd >= 0) {
+            char buffer[256];
+            snprintf(buffer, sizeof(buffer), "%s %d", process_name ? process_name : "unknown", pid);
+            
+            // 发送数据
+            write(companion_fd, buffer, strlen(buffer));
+            
+            // 等待 ACK，超时时间设为 200ms
+            // 这确保 Companion 接收到了数据，且我们不会过早关闭导致 Bad File Descriptor
+            struct timeval tv = {0, 200000}; 
+            setsockopt(companion_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            
+            char signal[16] = {0};
+            read(companion_fd, signal, sizeof(signal) - 1);
+            
+            close(companion_fd);
+            companion_fd = -1;
         }
         
-        api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
-        api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-    }
-
-void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-    const char* process_name = nullptr;
-    if (args->nice_name) process_name = env->GetStringUTFChars(args->nice_name, nullptr);
-    if (!process_name) process_name = getprogname();
-    
-    pid_t pid = getpid();
-
-    // 1. 【彻底旁路】如果是媒体存储进程，只装 Hook，不准碰任何 IPC
-    if (process_name && (strcmp(process_name, "com.android.providers.media.module") == 0 || 
-                         strcmp(process_name, "com.android.providers.media") == 0 ||
-                         strstr(process_name, "android.process.media"))) {
-        
-        LOGI("Detected critical system process: %s. Applying Dobby Hook only, bypassing IPC.", process_name);
-        install_dobby_hooks();
-        
-        // 释放内存并直接返回，不再执行下面的 companion 逻辑
         if (args->nice_name && process_name) env->ReleaseStringUTFChars(args->nice_name, process_name);
-        if (companion_fd >= 0) { close(companion_fd); companion_fd = -1; }
-        return; 
     }
-
-    // 2. 对于普通 App，执行原有的逻辑
-    if (companion_fd >= 0) {
-        // 设置极短的超时，防止 injector 挂了导致 App 卡死
-        struct timeval tv = {0, 500000}; // 500ms
-        setsockopt(companion_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-        char buffer[256];
-        snprintf(buffer, sizeof(buffer), "%s %d", process_name ? process_name : "unknown", pid);
-        
-        // 发送并快速读取（或者直接不读取，改为异步）
-        write(companion_fd, buffer, strlen(buffer));
-        
-        char signal[32] = {0};
-        read(companion_fd, signal, sizeof(signal) - 1); 
-        
-        close(companion_fd);
-        companion_fd = -1;
-    }
-    
-    if (args->nice_name && process_name) env->ReleaseStringUTFChars(args->nice_name, process_name);
-}
 
 private:
     zygisk::Api *api = nullptr;
