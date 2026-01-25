@@ -1,3 +1,4 @@
+FILENAME: zygisk_module.cpp
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -18,7 +19,7 @@
 #include <poll.h>
 
 #include "zygisk.hpp"
-#include "dobby.h" // 引入同目录下的 Dobby 头文件
+#include "dobby.h" 
 
 #define LOG_TAG "Zygisk_NSProxy"
 #define TARGET_SOCKET_PATH "/data/Namespace-Proxy/ipc.sock"
@@ -32,7 +33,6 @@ static char g_process_name[256] = {"unknown"};
 static std::atomic<bool> g_hooks_active(false);
 
 // --- 原始函数指针 (由 Dobby 回填) ---
-// 注意：Dobby 要求 orig 指针必须是指向函数的指针
 static int (*orig_openat)(int, const char*, int, mode_t) = nullptr;
 static int (*orig_mkdirat)(int, const char*, mode_t) = nullptr;
 
@@ -62,15 +62,12 @@ static bool is_path_blocked(const char* path) {
 }
 
 // --- 代理函数 (Proxy Functions) ---
-// 这里的签名必须与原始函数严格一致
-
 int my_openat(int fd, const char* path, int flags, mode_t mode) {
     if (g_hooks_active && is_path_blocked(path)) {
         z_log("BLOCKED openat: %s", path);
         errno = ENOENT;
         return -1;
     }
-    // 调用 Dobby 提供的原始函数跳板
     return orig_openat(fd, path, flags, mode);
 }
 
@@ -87,13 +84,10 @@ int my_mkdirat(int fd, const char* path, mode_t mode) {
 static bool install_hooks() {
     z_log("正在使用 Dobby 初始化 Hooks...");
 
-    // 1. 解析 libc.so 中的符号地址
-    // DobbySymbolResolver 会自动处理 map 解析，比 dlsym 更底层更安全
     void* sym_openat = DobbySymbolResolver("libc.so", "openat");
     void* sym_mkdirat = DobbySymbolResolver("libc.so", "mkdirat");
 
     if (!sym_openat || !sym_mkdirat) {
-        // 如果 libc.so 找不到，尝试默认路径 (NULL)
         if (!sym_openat) sym_openat = DobbySymbolResolver(nullptr, "openat");
         if (!sym_mkdirat) sym_mkdirat = DobbySymbolResolver(nullptr, "mkdirat");
     }
@@ -103,11 +97,6 @@ static bool install_hooks() {
         return false;
     }
 
-    z_log("解析成功: openat=%p, mkdirat=%p", sym_openat, sym_mkdirat);
-
-    // 2. 执行 Inline Hook
-    // DobbyHook(目标地址, 代理函数地址, 接收原始蹦床的指针)
-    
     int ret_open = DobbyHook(sym_openat, (dobby_dummy_func_t)my_openat, (dobby_dummy_func_t*)&orig_openat);
     int ret_mkdir = DobbyHook(sym_mkdirat, (dobby_dummy_func_t)my_mkdirat, (dobby_dummy_func_t*)&orig_mkdirat);
 
@@ -122,15 +111,12 @@ static bool install_hooks() {
 
 // --- 异步工作线程 ---
 static void async_setup_thread() {
-    // 稍微延时，确保 libc 完全初始化
-    // 实际上 Inline Hook libc 可以在早期进行，但为了保险起见
     usleep(100000); 
 
     if (install_hooks()) {
         g_hooks_active = true;
     }
 
-    // Companion 通信循环 (保持不变)
     while (true) {
         int fd = g_api->connectCompanion();
         if (fd < 0) {
@@ -138,12 +124,27 @@ static void async_setup_thread() {
             continue;
         }
 
-        if (write(fd, "PROXY_CONNECT", 14) <= 0) { close(fd); sleep(1); continue; }
+        // 1. 发送握手请求
+        if (write(fd, "PROXY_CONNECT", 14) <= 0) { 
+            close(fd); sleep(1); continue; 
+        }
         
-        char report[256];
-        snprintf(report, sizeof(report), "REPORT %s %d STATUS:DOBBY_ACTIVE", g_process_name, getpid());
-        if (write(fd, report, strlen(report)) <= 0) { close(fd); sleep(1); continue; }
+        // 2. [修复] 等待 Companion 的 ACK 确认
+        // 这确保了 Companion 已经建立了与后端的连接，并且处于转发模式
+        char ack_buf[16] = {0};
+        if (read(fd, ack_buf, sizeof(ack_buf)) <= 0 || strcmp(ack_buf, "OK") != 0) {
+            z_log("Companion 握手失败或未收到 ACK");
+            close(fd); sleep(1); continue;
+        }
 
+        // 3. 安全发送 REPORT
+        char report[256];
+        snprintf(report, sizeof(report), "REPORT %s %d STATUS:HOOKED", g_process_name, getpid());
+        if (write(fd, report, strlen(report)) <= 0) { 
+            close(fd); sleep(1); continue; 
+        }
+
+        // 4. 读取规则
         char buf[8192];
         ssize_t len;
         while ((len = read(fd, buf, sizeof(buf) - 1)) > 0) {
@@ -151,7 +152,8 @@ static void async_setup_thread() {
             if (strncmp(buf, "SET_RULES:", 10) == 0) {
                 std::lock_guard<std::mutex> lock(g_rule_mutex);
                 g_block_rules.clear();
-                char* data = buf + 10; char* token = strtok(data, ",");
+                char* data = buf + 10; 
+                char* token = strtok(data, ",");
                 while (token) {
                     if (*token) g_block_rules.emplace_back(token);
                     token = strtok(nullptr, ",");
@@ -165,7 +167,6 @@ static void async_setup_thread() {
 }
 
 // --- Companion 逻辑 (Root 进程) ---
-// 负责 socket 桥接，无需改动
 static void companion_proxy_bridge(int client_fd, int target_fd) {
     struct pollfd fds[2];
     fds[0].fd = client_fd; fds[0].events = POLLIN;
@@ -175,8 +176,9 @@ static void companion_proxy_bridge(int client_fd, int target_fd) {
     while (poll(fds, 2, -1) > 0) {
         for (int i = 0; i < 2; ++i) {
             if (fds[i].revents & POLLIN) {
+                int source = fds[i].fd;
                 int dest = (i == 0) ? target_fd : client_fd;
-                ssize_t n = read(fds[i].fd, buffer, sizeof(buffer));
+                ssize_t n = read(source, buffer, sizeof(buffer));
                 if (n <= 0 || write(dest, buffer, n) != n) goto end_bridge;
             }
             if (fds[i].revents & (POLLHUP | POLLERR)) goto end_bridge;
@@ -189,15 +191,31 @@ end_bridge:
 
 static void companion_handler(int client_fd) {
     char buf[64] = {0};
+    // 读取握手包
     if (read(client_fd, buf, sizeof(buf) - 1) <= 0) { close(client_fd); return; }
 
     if (strcmp(buf, "PROXY_CONNECT") == 0) {
         int target_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        struct sockaddr_un addr{.sun_family = AF_UNIX};
+        struct sockaddr_un addr = {0}; // 使用 C++ 写法初始化
+        addr.sun_family = AF_UNIX;
         strncpy(addr.sun_path, TARGET_SOCKET_PATH, sizeof(addr.sun_path)-1);
+        
         if (connect(target_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-            close(target_fd); close(client_fd); return;
+            // 连接后端失败
+            close(target_fd); 
+            close(client_fd); 
+            return;
         }
+
+        // [修复] 关键点：向 Client 发送 ACK
+        // 告诉 Client 我们已经连接好后端了，现在开始转发
+        if (write(client_fd, "OK", 3) != 3) {
+            close(target_fd);
+            close(client_fd);
+            return;
+        }
+
+        // 进入透明转发模式
         companion_proxy_bridge(client_fd, target_fd);
     } else {
         close(client_fd);
@@ -213,7 +231,6 @@ public:
         const char* nice_name = nullptr;
         if (args->nice_name) nice_name = env->GetStringUTFChars(args->nice_name, nullptr);
         
-        // 目标进程过滤
         if (nice_name && (
             strstr(nice_name, "android.providers.media") || 
             strstr(nice_name, "android.process.media") ||
@@ -232,9 +249,7 @@ public:
             return; 
         }
         
-        // 关闭 Near Branch Trampoline (对于 Android arm64 某些情况下更稳定)
-        // dobby_disable_near_branch_trampoline(); 
-        
+        // 启动异步线程
         std::thread(async_setup_thread).detach();
     }
 private:
