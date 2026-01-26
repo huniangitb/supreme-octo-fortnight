@@ -23,6 +23,7 @@
 #define LOG_TAG "Zygisk_NSProxy"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)  // 新增 INFO 级别日志
 
 static const char* INJECTOR_SOCKET_PATH = "/data/Namespace-Proxy/ipc.sock";
 static const char* RULES_FILE_PATH = "/data/Namespace-Proxy/zygisk_rules.conf";
@@ -421,6 +422,9 @@ static void companion_handler(int client_fd) {
         close(client_fd); return;
     }
     
+    // 记录接收到的请求信息到 logcat
+    LOGI("Companion接收到请求: 包名=%s, PID=%d", pkg_name, pid);
+    
     // 1. 上报给 Injector
     int injector_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     
@@ -435,12 +439,26 @@ static void companion_handler(int client_fd) {
         if (connect(injector_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
             char report_msg[512];
             snprintf(report_msg, sizeof(report_msg), "REPORT %s %d", pkg_name, pid);
+            
+            // 记录发送给 Injector 的信息
+            LOGI("向Injector发送: %s", report_msg);
+            
             if (write(injector_fd, report_msg, strlen(report_msg)) > 0) {
                 char resp[32];
-                read(injector_fd, resp, sizeof(resp));
+                int resp_len = read(injector_fd, resp, sizeof(resp));
+                if (resp_len > 0) {
+                    resp[resp_len] = '\0';
+                    LOGI("Injector响应: %s", resp);
+                }
+            } else {
+                LOGE("发送到Injector失败: %s", strerror(errno));
             }
+        } else {
+            LOGE("连接到Injector失败: %s", strerror(errno));
         }
         close(injector_fd);
+    } else {
+        LOGE("创建socket失败: %s", strerror(errno));
     }
     
     // 2. 读取规则文件
@@ -454,10 +472,19 @@ static void companion_handler(int client_fd) {
             rules_content = file_buf;
         }
         close(file_fd);
+        LOGD("从文件读取规则: %s", RULES_FILE_PATH);
+    } else {
+        LOGD("规则文件不存在: %s", RULES_FILE_PATH);
     }
     
     // 3. 将规则返回给 App
-    write(client_fd, rules_content, strlen(rules_content));
+    ssize_t written = write(client_fd, rules_content, strlen(rules_content));
+    if (written > 0) {
+        LOGI("向包名=%s, PID=%d 返回规则，大小: %zd", pkg_name, pid, written);
+    } else {
+        LOGE("向包名=%s, PID=%d 返回规则失败: %s", pkg_name, pid, strerror(errno));
+    }
+    
     close(client_fd);
 }
 
@@ -476,11 +503,13 @@ static void* hot_reload_thread(void* arg) {
     if (cmdline) {
         if (fgets(proc_name, sizeof(proc_name), cmdline)) {
             pkg_name = strdup(proc_name);
+            LOGD("热加载线程: 进程名=%s, PID=%d", pkg_name, my_pid);
         }
         fclose(cmdline);
     }
     
     if (!pkg_name) {
+        LOGE("热加载线程: 无法获取进程名");
         return NULL;
     }
     
@@ -488,11 +517,23 @@ static void* hot_reload_thread(void* arg) {
         sleep(5);
         
         int fd = api->connectCompanion();
-        if (fd < 0) continue;
+        if (fd < 0) {
+            LOGE("热加载线程: 连接Companion失败");
+            continue;
+        }
         
         char req[512];
         snprintf(req, sizeof(req), "REQ %s %d", pkg_name, my_pid);
-        write(fd, req, strlen(req));
+        
+        // 记录热加载请求
+        LOGD("热加载线程: 发送请求: %s", req);
+        
+        ssize_t sent = write(fd, req, strlen(req));
+        if (sent <= 0) {
+            LOGE("热加载线程: 发送请求失败: %s", strerror(errno));
+            close(fd);
+            continue;
+        }
         
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
         int ret = poll(&pfd, 1, 500);
@@ -502,8 +543,15 @@ static void* hot_reload_thread(void* arg) {
             ssize_t n = read(fd, buf, sizeof(buf) - 1);
             if (n > 0) {
                 buf[n] = '\0';
+                LOGD("热加载线程: 收到规则响应，长度: %zd", n);
                 parse_rules_string(buf);
+            } else if (n < 0) {
+                LOGE("热加载线程: 读取规则失败: %s", strerror(errno));
             }
+        } else if (ret == 0) {
+            LOGD("热加载线程: 请求超时");
+        } else {
+            LOGE("热加载线程: poll失败: %s", strerror(errno));
         }
         close(fd);
     }
@@ -521,6 +569,7 @@ public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override { 
         this->api = api; 
         this->env = env; 
+        LOGD("Zygisk模块已加载");
     }
     
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
@@ -537,28 +586,51 @@ public:
         this->pkg_name = proc_name;
         this->my_pid = getpid();
         
+        // 记录进程信息
+        LOGI("应用启动: 包名=%s, PID=%d", pkg_name, my_pid);
+        
         // 同步获取规则
         fetch_rules_sync(1000);
         
         // 决定是否启用Hook
         this->should_hook = is_target_media_process(proc_name);
+        LOGD("进程 %s Hook状态: %s", proc_name, should_hook ? "启用" : "禁用");
         free(proc_name);
     }
     
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
         if (!should_hook) {
+            LOGI("进程 %s 为非媒体进程，卸载模块", pkg_name);
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            // 清理资源
+            if (pkg_name) {
+                free(pkg_name);
+                pkg_name = NULL;
+            }
             return;
         }
         
+        LOGI("进程 %s 为媒体进程，安装Hook", pkg_name);
         install_hooks();
         
         // 启动热加载线程
         pthread_t tid;
-        pthread_create(&tid, NULL, hot_reload_thread, api);
-        pthread_detach(tid);
+        if (pthread_create(&tid, NULL, hot_reload_thread, api) == 0) {
+            pthread_detach(tid);
+            LOGD("热加载线程已启动");
+        } else {
+            LOGE("热加载线程启动失败");
+        }
         
-        LOGD("[%s] Media Shield 激活", pkg_name);
+        LOGI("[%s] Media Shield 激活", pkg_name);
+    }
+    
+    ~AppReporterModule() {
+        // 清理资源
+        if (pkg_name) {
+            free(pkg_name);
+            pkg_name = NULL;
+        }
     }
     
 private:
@@ -570,11 +642,23 @@ private:
     
     void fetch_rules_sync(int timeout_ms) {
         int fd = api->connectCompanion();
-        if (fd < 0) return;
+        if (fd < 0) {
+            LOGE("无法连接Companion");
+            return;
+        }
         
         char req[512];
         snprintf(req, sizeof(req), "REQ %s %d", pkg_name, my_pid);
-        write(fd, req, strlen(req));
+        
+        // 记录请求信息
+        LOGI("发送请求到Companion: %s", req);
+        
+        ssize_t sent = write(fd, req, strlen(req));
+        if (sent <= 0) {
+            LOGE("发送请求失败: %s", strerror(errno));
+            close(fd);
+            return;
+        }
         
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
         int ret = poll(&pfd, 1, timeout_ms);
@@ -584,23 +668,46 @@ private:
             ssize_t n = read(fd, buf, sizeof(buf) - 1);
             if (n > 0) {
                 buf[n] = '\0';
+                LOGD("收到规则响应，长度: %zd", n);
                 parse_rules_string(buf);
+            } else if (n < 0) {
+                LOGE("读取规则失败: %s", strerror(errno));
+            } else {
+                LOGD("规则响应为空");
             }
+        } else if (ret == 0) {
+            LOGD("规则请求超时");
+        } else {
+            LOGE("poll失败: %s", strerror(errno));
         }
         close(fd);
     }
     
     void install_hooks() {
-        if (g_hooks_installed) return;
+        if (g_hooks_installed) {
+            LOGD("Hook已安装，跳过");
+            return;
+        }
+        
+        LOGI("开始安装Hook...");
         
         void *h = dlopen("libc.so", RTLD_NOW);
-        if (!h) return;
+        if (!h) {
+            LOGE("无法打开 libc.so: %s", dlerror());
+            return;
+        }
         
         #define DO_HOOK(name) \
             do { \
                 void* sym_##name = dlsym(h, #name); \
                 if (sym_##name) { \
-                    DobbyHook(sym_##name, (void*)fake_##name, (void**)&orig_##name); \
+                    if (DobbyHook(sym_##name, (void*)fake_##name, (void**)&orig_##name) == 0) { \
+                        LOGD("Hook %s 成功", #name); \
+                    } else { \
+                        LOGE("Hook %s 失败", #name); \
+                    } \
+                } else { \
+                    LOGE("找不到符号 %s", #name); \
                 } \
             } while(0)
         
@@ -615,6 +722,7 @@ private:
         
         dlclose(h);
         g_hooks_installed = true;
+        LOGI("Hook安装完成");
     }
 };
 
