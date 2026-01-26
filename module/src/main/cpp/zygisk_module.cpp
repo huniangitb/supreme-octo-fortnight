@@ -23,7 +23,7 @@
 #define LOG_TAG "Zygisk_NSProxy"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)  // 新增 INFO 级别日志
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 static const char* INJECTOR_SOCKET_PATH = "/data/Namespace-Proxy/ipc.sock";
 static const char* RULES_FILE_PATH = "/data/Namespace-Proxy/zygisk_rules.conf";
@@ -61,7 +61,11 @@ static int (*orig_getdents64)(unsigned int fd, struct linux_dirent64 *dirp, unsi
 
 // 去除路径末尾斜杠
 static char* normalize_path(const char* p) {
-    if (!p || p[0] == '\0') return strdup("");
+    if (!p || p[0] == '\0') {
+        char* empty = (char*)malloc(1);
+        if (empty) empty[0] = '\0';
+        return empty;
+    }
     
     size_t len = strlen(p);
     while (len > 1 && p[len - 1] == '/') {
@@ -159,14 +163,15 @@ static void parse_rules_string(const char* raw_data) {
         end = strchr(start, ',');
         if (!end) end = start + strlen(start);
         
-        // 查找管道符
-        const char* pipe = memchr(start, '|', end - start);
+        // 查找管道符 - 修复：使用 char* 而不是 const char*
+        char* pipe = (char*)memchr(start, '|', end - start);
         if (pipe) {
             // 提取source部分
-            char* source = (char*)malloc(pipe - start + 1);
+            size_t source_len = pipe - start;
+            char* source = (char*)malloc(source_len + 1);
             if (source) {
-                strncpy(source, start, pipe - start);
-                source[pipe - start] = '\0';
+                strncpy(source, start, source_len);
+                source[source_len] = '\0';
                 
                 // 标准化source
                 char* norm_source = normalize_path(source);
@@ -462,7 +467,8 @@ static void companion_handler(int client_fd) {
     }
     
     // 2. 读取规则文件
-    char* rules_content = "EMPTY";
+    const char* default_rules = "EMPTY";  // 修复：使用 const char*
+    const char* rules_content = default_rules;
     char file_buf[8192] = {0};
     int file_fd = open(RULES_FILE_PATH, O_RDONLY);
     if (file_fd >= 0) {
