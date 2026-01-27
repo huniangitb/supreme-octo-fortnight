@@ -21,16 +21,17 @@
 #include "dobby.h"
 
 #define LOG_TAG "Zygisk_NSProxy"
+// 定义带文件行号的日志宏，方便定位错误
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "[ERROR] " __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOG_TRACE(msg) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, "[Trace] %s", msg)
 
-// 必须与 Injector 保持一致
 static const char* INJECTOR_SOCKET_PATH = "/data/Namespace-Proxy/ipc.sock";
 static const char* RULES_FILE_PATH = "/data/Namespace-Proxy/zygisk_rules.conf";
 
 // ==========================================
-// 数据结构与全局变量 (纯 C)
+// 数据结构与全局变量
 // ==========================================
 
 typedef struct RedirectRule {
@@ -47,7 +48,7 @@ typedef struct RuleList {
 static RuleList g_rules = {0};
 static pthread_mutex_t g_rules_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool g_hooks_installed = false;
-static __thread bool g_is_hooking = false; // 防止递归 Hook
+static __thread bool g_is_hooking = false;
 
 // 原始函数指针
 static int (*orig_openat)(int dirfd, const char *pathname, int flags, ...);
@@ -94,7 +95,7 @@ static bool is_target_media_process(const char* name) {
 }
 
 // ==========================================
-// 规则解析逻辑
+// 规则管理
 // ==========================================
 
 static void clear_rule_list(RuleList* list) {
@@ -125,9 +126,13 @@ static bool add_rule(RuleList* list, const char* source, const char* target) {
 }
 
 static void parse_rules_string(const char* raw_data) {
-    if (!raw_data || strncmp(raw_data, "SET_RULES:", 10) != 0) return;
-    const char* data = raw_data + 10;
+    if (!raw_data) return;
+    if (strncmp(raw_data, "SET_RULES:", 10) != 0) {
+        LOGE("规则格式错误，头部不匹配: %.20s...", raw_data);
+        return;
+    }
     
+    const char* data = raw_data + 10;
     RuleList new_rules = {0};
     
     const char* start = data;
@@ -147,7 +152,10 @@ static void parse_rules_string(const char* raw_data) {
             
             char *n_src = normalize_path(src);
             char *n_dst = normalize_path(dst);
-            if (n_src && n_dst) add_rule(&new_rules, n_src, n_dst);
+            
+            if (n_src && n_dst && n_src[0] != '\0') {
+                add_rule(&new_rules, n_src, n_dst);
+            }
             
             free(src); free(dst);
             free(n_src); free(n_dst);
@@ -159,11 +167,16 @@ static void parse_rules_string(const char* raw_data) {
     pthread_mutex_lock(&g_rules_mutex);
     clear_rule_list(&g_rules);
     g_rules = new_rules;
+    size_t count = g_rules.count;
     pthread_mutex_unlock(&g_rules_mutex);
+    
+    LOGI("规则加载完毕，当前生效规则数: %zu", count);
 }
 
+// 核心路径匹配逻辑
 static char* get_redirected_path(const char* pathname) {
     if (!pathname || pathname[0] != '/') return NULL;
+    // 简单优化：只处理 /storage 开头
     if (strncmp(pathname, "/storage", 8) != 0) return NULL;
     
     char* current = normalize_path(pathname);
@@ -171,12 +184,17 @@ static char* get_redirected_path(const char* pathname) {
     
     char* result = NULL;
     pthread_mutex_lock(&g_rules_mutex);
+    
     for (size_t i = 0; i < g_rules.count; i++) {
         RedirectRule* rule = &g_rules.rules[i];
+        
+        // 精确匹配
         if (strcmp(current, rule->source) == 0) {
             result = strdup(rule->target);
             break;
         }
+        
+        // 目录前缀匹配
         size_t slen = strlen(rule->source);
         if (strncmp(current, rule->source, slen) == 0 && current[slen] == '/') {
             size_t rlen = strlen(rule->target) + strlen(current + slen) + 1;
@@ -186,6 +204,11 @@ static char* get_redirected_path(const char* pathname) {
         }
     }
     pthread_mutex_unlock(&g_rules_mutex);
+    
+    if (result) {
+        LOGD("[规则命中] %s -> %s", current, result);
+    }
+    
     free(current);
     return result;
 }
@@ -318,67 +341,107 @@ static int fake_getdents64(unsigned int fd, struct linux_dirent64 *dirp, unsigne
 }
 
 // ==========================================
-// Companion (Root Process)
+// Companion (Root 权限) - 通信核心
 // ==========================================
 
 static void companion_handler(int client_fd) {
     char buf[1024];
+    // 读取 App 发来的请求
     ssize_t len = read(client_fd, buf, sizeof(buf) - 1);
-    if (len <= 0) { close(client_fd); return; }
+    if (len <= 0) { 
+        LOGE("Companion: 读取 App 请求失败或 EOF: %s", strerror(errno));
+        close(client_fd); 
+        return; 
+    }
     buf[len] = '\0';
     
     char pkg_name[256];
     int pid = 0;
     if (sscanf(buf, "REQ %255s %d", pkg_name, &pid) != 2) {
-        close(client_fd); return;
+        LOGE("Companion: 请求格式错误: %s", buf);
+        close(client_fd); 
+        return;
     }
     
-    // 1. 连接 Injector Socket 进行汇报 (Handshake)
-    // Injector 会在收到 REPORT 后处理挂载，处理完返回 OK
-    // 我们在这里等待，也就间接阻塞了 App
+    LOGD("Companion: 收到 App 请求: %s PID=%d", pkg_name, pid);
+
+    // 1. 连接 Injector Socket
     int inj_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (inj_fd >= 0) {
+    if (inj_fd < 0) {
+        LOGE("Companion: 创建 Socket 失败: %s", strerror(errno));
+    } else {
         struct sockaddr_un addr = { .sun_family = AF_UNIX };
+        // 安全地复制路径
         strncpy(addr.sun_path, INJECTOR_SOCKET_PATH, sizeof(addr.sun_path) - 1);
         
-        // Companion 连接 Injector 的超时，防止 Injector 卡死
+        // 设置 2 秒超时
         struct timeval tv = { .tv_sec = 2, .tv_usec = 0 }; 
         setsockopt(inj_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(inj_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         
+        LOGD("Companion: 尝试连接 Injector: %s", INJECTOR_SOCKET_PATH);
+        
         if (connect(inj_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
             char report[512];
             snprintf(report, sizeof(report), "REPORT %s %d", pkg_name, pid);
+            
+            LOGD("Companion: 发送 REPORT 指令...");
             if (write(inj_fd, report, strlen(report)) > 0) {
                 char resp[32];
-                // **关键阻塞点**: 等待 Injector 回复 "OK"
-                // 这段时间内，APP 端的 read() 也会阻塞
-                read(inj_fd, resp, sizeof(resp)); 
+                LOGD("Companion: 等待 Injector 响应...");
+                ssize_t n = read(inj_fd, resp, sizeof(resp));
+                if (n > 0) {
+                    resp[n] = '\0';
+                    LOGD("Companion: Injector 响应: %s", resp);
+                } else {
+                    LOGE("Companion: Injector 无响应或连接关闭");
+                }
+            } else {
+                LOGE("Companion: 发送数据失败: %s", strerror(errno));
             }
+        } else {
+            // 这是最常见的错误点
+            LOGE("Companion: 连接 Injector 失败 (errno=%d): %s", errno, strerror(errno));
+            if (errno == ENOENT) LOGE("Companion: 提示 - Socket 文件不存在，Injector 未运行？");
+            if (errno == ECONNREFUSED) LOGE("Companion: 提示 - Injector 拒绝连接，是否在监听？");
+            if (errno == EACCES) LOGE("Companion: 提示 - 权限不足 (SELinux/chmod)");
         }
         close(inj_fd);
     }
     
     // 2. 读取规则文件
-    // 此时 Injector 应该已经处理完挂载或忽略，并更新了规则文件
-    char rules_buf[16384] = {0}; 
-    int fd = open(RULES_FILE_PATH, O_RDONLY);
-    if (fd >= 0) {
-        ssize_t n = read(fd, rules_buf, sizeof(rules_buf) - 1);
-        if (n > 0) rules_buf[n] = '\0';
-        else strcpy(rules_buf, "SET_RULES:");
-        close(fd);
-    } else {
-        strcpy(rules_buf, "SET_RULES:");
+    char* rules_buf = (char*)malloc(32768); // 32KB
+    if (!rules_buf) {
+        LOGE("Companion: 内存分配失败");
+        close(client_fd);
+        return;
     }
     
-    // 3. 返回数据给 App，解除 App 的阻塞
-    write(client_fd, rules_buf, strlen(rules_buf));
+    strcpy(rules_buf, "SET_RULES:"); // 默认头
+    
+    int fd = open(RULES_FILE_PATH, O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, rules_buf, 32767);
+        if (n > 0) rules_buf[n] = '\0';
+        close(fd);
+        LOGD("Companion: 读取到规则文件，长度: %zd", n);
+    } else {
+        LOGE("Companion: 无法打开规则文件 %s: %s", RULES_FILE_PATH, strerror(errno));
+    }
+    
+    // 3. 返回给 App
+    if (write(client_fd, rules_buf, strlen(rules_buf)) < 0) {
+        LOGE("Companion: 回传 App 失败: %s", strerror(errno));
+    } else {
+        LOGD("Companion: 握手完成，已回复 App");
+    }
+    
+    free(rules_buf);
     close(client_fd);
 }
 
 // ==========================================
-// Zygisk Module (App Process)
+// Zygisk Module (App 进程)
 // ==========================================
 
 struct HotReloadArgs {
@@ -391,6 +454,8 @@ static void* hot_reload_thread(void* arg) {
     struct HotReloadArgs* args = (struct HotReloadArgs*)arg;
     pthread_detach(pthread_self());
     
+    char* buf = (char*)malloc(32768);
+    
     while (1) {
         sleep(10); 
         int fd = args->api->connectCompanion();
@@ -398,17 +463,18 @@ static void* hot_reload_thread(void* arg) {
             char req[512];
             snprintf(req, sizeof(req), "REQ %s %d", args->pkg, args->pid);
             if (write(fd, req, strlen(req)) > 0) {
-                // 热加载不需要 poll 等待太久，Injector 已经知道这个 PID 了
-                char buf[16384];
-                ssize_t n = read(fd, buf, sizeof(buf) - 1);
-                if (n > 0) {
-                    buf[n] = '\0';
-                    parse_rules_string(buf);
+                if (buf) {
+                    ssize_t n = read(fd, buf, 32767);
+                    if (n > 0) {
+                        buf[n] = '\0';
+                        parse_rules_string(buf);
+                    }
                 }
             }
             close(fd);
         }
     }
+    if (buf) free(buf);
     free(args->pkg);
     free(args);
     return NULL;
@@ -421,7 +487,6 @@ public:
         this->env = env; 
     }
     
-    // 阶段 1: 应用 Fork 早期
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         const char* proc_raw = nullptr;
         if (args->nice_name) proc_raw = env->GetStringUTFChars(args->nice_name, nullptr);
@@ -430,64 +495,59 @@ public:
         this->my_pid = getpid();
         if (proc_raw) env->ReleaseStringUTFChars(args->nice_name, proc_raw);
 
-        // 判定是否为媒体进程
         this->should_hook = is_target_media_process(this->pkg_name);
 
-        // ======================================================
-        // 核心握手逻辑 (Handshake & Wait)
-        // 任何应用都需要在此处等待 Injector 处理完成 (Mount/Namespace)
-        // ======================================================
-        
+        LOGI("App [%s] 正在连接 Companion...", pkg_name);
+
         int fd = api->connectCompanion();
         if (fd >= 0) {
             char req[512];
             snprintf(req, sizeof(req), "REQ %s %d", pkg_name, my_pid);
+            
             if (write(fd, req, strlen(req)) > 0) {
-                // 使用 poll 阻塞等待回包
+                // 阻塞等待
                 struct pollfd pfd = { .fd = fd, .events = POLLIN };
-                
-                // **超时设置**: 1000ms (1秒)
-                // 如果 Injector 在 1秒内没处理完，我们就不等了，防止应用卡死
+                // 1秒超时
                 int ret = poll(&pfd, 1, 1000);
                 
                 if (ret > 0 && (pfd.revents & POLLIN)) {
-                    // Injector 处理完毕，读取规则 (即使是空规则)
-                    char buf[16384];
-                    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-                    if (n > 0) {
-                        buf[n] = '\0';
-                        // 只有媒体进程需要解析规则，其他进程拿到数据后也是丢弃
-                        if (should_hook) {
-                            parse_rules_string(buf);
+                    char* buf = (char*)malloc(32768);
+                    if (buf) {
+                        ssize_t n = read(fd, buf, 32767);
+                        if (n > 0) {
+                            buf[n] = '\0';
+                            if (should_hook) {
+                                LOGD("App: 收到规则数据，长度 %zd", n);
+                                parse_rules_string(buf);
+                            }
+                        } else {
+                            LOGE("App: 读取规则数据为空或失败: %s", strerror(errno));
                         }
+                        free(buf);
                     }
+                } else if (ret == 0) {
+                    LOGE("App: 等待 Injector 响应超时 (1000ms)");
                 } else {
-                    LOGD("等待 Injector 超时，跳过 (App: %s)", pkg_name);
+                    LOGE("App: poll 错误: %s", strerror(errno));
                 }
+            } else {
+                LOGE("App: 发送 REQ 失败: %s", strerror(errno));
             }
             close(fd);
         } else {
-            // 连不上 Companion (可能 Zygisk 异常)，直接跳过，不崩溃
-            LOGE("无法连接 Companion，跳过握手");
+            LOGE("App: connectCompanion 失败，Zygisk API 异常？");
         }
     }
     
-    // 阶段 2: 准备完毕，根据身份决定是否卸载
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
         if (!should_hook) {
-            // 对于普通应用：
-            // 握手已在 preAppSpecialize 完成 (Injector 已被通知)
-            // 现在可以安全地请求卸载 .so，释放内存
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-            
             free(pkg_name);
             pkg_name = NULL;
             return;
         }
         
-        // 对于媒体进程：
-        // 保留模块，安装 Inline Hook
-        LOGI("启用媒体重定向 Hook: %s", pkg_name);
+        LOGI("App [%s] 激活 Hook...", pkg_name);
         
         void *h = dlopen("libc.so", RTLD_NOW);
         if (h) {
@@ -496,9 +556,10 @@ public:
             H(access); H(stat); H(lstat); H(getdents64);
             dlclose(h);
             g_hooks_installed = true;
+        } else {
+            LOGE("无法打开 libc.so: %s", dlerror());
         }
         
-        // 启动热加载线程
         struct HotReloadArgs* t_args = (struct HotReloadArgs*)malloc(sizeof(struct HotReloadArgs));
         if (t_args) {
             t_args->api = api;
