@@ -112,6 +112,11 @@ static void clear_rule_list(RuleList* list) {
 }
 
 static bool add_rule(RuleList* list, const char* source, const char* target) {
+    // 双重保险：再次校验
+    if (!is_valid_rule(source, target)) {
+        return false;
+    }
+
     if (list->count >= list->capacity) {
         size_t new_capacity = list->capacity == 0 ? 8 : list->capacity * 2;
         RedirectRule* new_rules = (RedirectRule*)realloc(list->rules, new_capacity * sizeof(RedirectRule));
@@ -125,6 +130,48 @@ static bool add_rule(RuleList* list, const char* source, const char* target) {
     return true;
 }
 
+// ==========================================
+// 规则校验与管理
+// ==========================================
+
+// [新增] 校验规则合法性
+static bool is_valid_rule(const char* source, const char* target) {
+    if (!source || !target) return false;
+
+    // 1. 基础非空检查
+    if (source[0] == '\0' || target[0] == '\0') {
+        return false;
+    }
+
+    // 2. 必须是绝对路径
+    if (source[0] != '/' || target[0] != '/') {
+        LOGE("[规则忽略] 路径必须以 / 开头 (非绝对路径): %s -> %s", source, target);
+        return false;
+    }
+
+    // 3. 防止源和目标相同 (无意义且浪费性能)
+    if (strcmp(source, target) == 0) {
+        LOGE("[规则忽略] 源路径与目标路径完全相同: %s", source);
+        return false;
+    }
+
+    // 4. [关键] 防止递归重定向 (目标路径包含源路径)
+    // 例如: /storage/emulated/0 -> /storage/emulated/0/SubDir
+    // 这会导致无限循环，是导致你日志崩溃的元凶
+    size_t src_len = strlen(source);
+    if (strncmp(target, source, src_len) == 0) {
+        // 确保匹配的是完整目录名，例如 /a -> /ab 是合法的，但 /a -> /a/b 是非法的
+        if (target[src_len] == '/' || target[src_len] == '\0') {
+            LOGE("[规则忽略] 检测到递归死循环 (目标是源的子目录): %s -> %s", source, target);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+
 static void parse_rules_string(const char* raw_data) {
     if (!raw_data) return;
     if (strncmp(raw_data, "SET_RULES:", 10) != 0) {
@@ -134,6 +181,8 @@ static void parse_rules_string(const char* raw_data) {
     
     const char* data = raw_data + 10;
     RuleList new_rules = {0};
+    int added_count = 0;
+    int ignored_count = 0;
     
     const char* start = data;
     while (*start) {
@@ -150,11 +199,17 @@ static void parse_rules_string(const char* raw_data) {
             char* dst = (char*)malloc(dst_len + 1);
             strncpy(dst, pipe + 1, dst_len); dst[dst_len] = '\0';
             
+            // 归一化处理（去除末尾斜杠）
             char *n_src = normalize_path(src);
             char *n_dst = normalize_path(dst);
             
-            if (n_src && n_dst && n_src[0] != '\0') {
-                add_rule(&new_rules, n_src, n_dst);
+            // 在这里进行校验
+            if (is_valid_rule(n_src, n_dst)) {
+                if (add_rule(&new_rules, n_src, n_dst)) {
+                    added_count++;
+                }
+            } else {
+                ignored_count++;
             }
             
             free(src); free(dst);
@@ -167,10 +222,10 @@ static void parse_rules_string(const char* raw_data) {
     pthread_mutex_lock(&g_rules_mutex);
     clear_rule_list(&g_rules);
     g_rules = new_rules;
-    size_t count = g_rules.count;
+    size_t total_count = g_rules.count;
     pthread_mutex_unlock(&g_rules_mutex);
     
-    LOGI("规则加载完毕，当前生效规则数: %zu", count);
+    LOGI("规则加载完毕。生效: %d 条，忽略非法规则: %d 条", added_count, ignored_count);
 }
 
 // 核心路径匹配逻辑
