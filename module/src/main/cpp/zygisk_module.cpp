@@ -29,7 +29,7 @@
 
 static const char* INJECTOR_SOCKET_PATH = "/data/Namespace-Proxy/ipc.sock";
 static const char* RULES_FILE_PATH = "/data/Namespace-Proxy/zygisk_rules.conf";
-
+static bool is_valid_rule(const char* source, const char* target);
 // ==========================================
 // 数据结构与全局变量
 // ==========================================
