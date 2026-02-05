@@ -18,7 +18,11 @@
 #include <ctype.h>
 
 #include "zygisk.hpp"
+
+// 1. 包裹 Dobby 头文件引用
+#ifdef USE_DOBBY
 #include "dobby.h"
+#endif
 
 #define LOG_TAG "Zygisk_NSProxy"
 // 定义带文件行号的日志宏，方便定位错误
@@ -169,8 +173,6 @@ static bool is_valid_rule(const char* source, const char* target) {
 
     return true;
 }
-
-
 
 static void parse_rules_string(const char* raw_data) {
     if (!raw_data) return;
@@ -412,7 +414,7 @@ static void companion_handler(int client_fd) {
     
     char pkg_name[256];
     int pid = 0;
-    if (sscanf(buf, "REQ %255s %d", pkg_name, &pid) != 2) {
+    if (sscanf(buf, "REQ %255s %d", pkg_name, pid) != 2) {
         LOGE("Companion: 请求格式错误: %s", buf);
         close(client_fd); 
         return;
@@ -603,7 +605,9 @@ public:
         }
         
         LOGI("App [%s] 激活 Hook...", pkg_name);
-        
+
+#ifdef USE_DOBBY
+        // --- 只有开启 Dobby 时才执行的代码 ---
         void *h = dlopen("libc.so", RTLD_NOW);
         if (h) {
             #define H(n) do { void* s = dlsym(h, #n); if(s) DobbyHook(s, (void*)fake_##n, (void**)&orig_##n); } while(0)
@@ -614,7 +618,11 @@ public:
         } else {
             LOGE("无法打开 libc.so: %s", dlerror());
         }
-        
+#else
+        // --- 如果 Dobby 被禁用 ---
+        LOGI("Dobby 功能已禁用，跳过 Hook 安装。");
+#endif
+
         struct HotReloadArgs* t_args = (struct HotReloadArgs*)malloc(sizeof(struct HotReloadArgs));
         if (t_args) {
             t_args->api = api;
