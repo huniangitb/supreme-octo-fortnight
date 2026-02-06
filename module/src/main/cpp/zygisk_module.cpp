@@ -1,6 +1,6 @@
 #include <android/log.h>
 #include <string.h>
-#include <stdio.h>
+#include <jni.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -10,216 +10,154 @@
 
 #include "zygisk.hpp"
 
+#define LOG_TAG "ZygiskFinal"
+// 调试开关
+// #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define LOGD(...)
+
 // ============================================================================
-// 1. 规则配置
+// 1. 规则定义
 // ============================================================================
+struct PropRule { const char* key; const char* value; };
 
-#define LOG_TAG "ZygiskPropCore"
-// 调试开关：生产环境请注释掉 LOGD
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
-//#define LOGD(...) 
-
-struct PropRule {
-    const char* key;
-    const char* value;
-};
-
-// 【在此配置你的规则】
 static const PropRule RULES[] = {
-    // 基础指纹模拟
+    // 基础防检测
     { "ro.build.tags", "release-keys" },
-    { "ro.build.type", "user" },
     { "ro.debuggable", "0" },
     { "ro.secure", "1" },
-    { "ro.adb.secure", "1" },
     { "sys.usb.state", "mtp" },
     
-    // 厂商伪装
-    { "ro.product.manufacturer", "Xiaomi" },
-    { "ro.product.brand", "Xiaomi" },
-    { "ro.product.model", "Mi 11" },
+    // 模拟机型信息 (JuiceSSH 等应用读取这里)
+    { "ro.product.manufacturer", "Google" },
+    { "ro.product.brand", "Google" },
+    { "ro.product.model", "Pixel 6" },
+    { "ro.product.device", "oriole" },
     
-    // 针对特定检测的隐藏
-    { "ro.modversion", NULL },
-    { "ro.magisk.deny.mount", NULL }
+    // 隐藏特征
+    { "ro.modversion", NULL }
 };
 
 #define RULE_COUNT (sizeof(RULES) / sizeof(RULES[0]))
 
-// ============================================================================
-// 2. 核心逻辑: 通用替换处理
-// ============================================================================
-
-// 统一的处理逻辑：检查 name，如果在规则中，则修改 value
-// 返回值：新的 value 长度；如果未修改则返回 -1
-static int try_replace_prop(const char *name, char *value) {
-    if (name == NULL || value == NULL) return -1;
-
+// 辅助查找
+const char* get_replacement(const char* key) {
+    if (!key) return nullptr;
     for (size_t i = 0; i < RULE_COUNT; i++) {
-        if (strcmp(name, RULES[i].key) == 0) {
-            const char* target_val = RULES[i].value;
-            
-            if (target_val == NULL) {
-                // 策略：隐藏 (置空)
-                value[0] = '\0';
-                LOGD("Hiding prop: %s", name);
-                return 0;
-            } else {
-                // 策略：替换
-                // PROP_VALUE_MAX = 92, 安全起见用 91
-                strncpy(value, target_val, 91);
-                value[91] = '\0';
-                LOGD("Replacing prop: %s -> %s", name, target_val);
-                return (int)strlen(value);
-            }
+        if (strcmp(key, RULES[i].key) == 0) {
+            return RULES[i].value;
         }
     }
-    return -1; // 未命中
+    return nullptr;
 }
 
 // ============================================================================
-// 3. Hook 函数定义 (覆盖 Android 12+ 三种读取路径)
+// 2. JNI Hook (针对 Java 层 SystemProperties) - 稳如老狗
 // ============================================================================
 
-// ----------------------------------------------------------------------------
-// Hook 1: __system_property_get
-// 最传统的 API，部分老应用和 Shell 命令使用
-// ----------------------------------------------------------------------------
-typedef int (*system_property_get_t)(const char *, char *);
-static system_property_get_t orig_system_property_get = NULL;
+// 原始 JNI 函数
+static jstring (*orig_native_get)(JNIEnv*, jclass, jstring, jstring) = nullptr;
 
-int my_system_property_get(const char *name, char *value) {
-    int len = 0;
-    if (orig_system_property_get) {
-        len = orig_system_property_get(name, value);
+// 我们的 JNI 代理
+jstring my_native_get(JNIEnv* env, jclass clazz, jstring key_jstr, jstring def_jstr) {
+    if (key_jstr == nullptr) return orig_native_get(env, clazz, key_jstr, def_jstr);
+
+    const char* key = env->GetStringUTFChars(key_jstr, nullptr);
+    const char* replace_val = get_replacement(key);
+    env->ReleaseStringUTFChars(key_jstr, key);
+
+    if (replace_val) {
+        LOGD("JNI Hook hit: %s -> %s", key, replace_val);
+        // 如果是 NULL (剔除)，返回空字符串
+        if (replace_val[0] == '\0') return env->NewStringUTF("");
+        return env->NewStringUTF(replace_val);
     }
-    
-    int new_len = try_replace_prop(name, value);
-    if (new_len != -1) {
-        return new_len;
-    }
-    return len;
+
+    return orig_native_get(env, clazz, key_jstr, def_jstr);
 }
 
-// ----------------------------------------------------------------------------
-// Hook 2: __system_property_read
-// 【关键】Android 12+ Java 层 SystemProperties.get() 底层常走此路
-// 签名: int __system_property_read(const prop_info *pi, char *name, char *value);
-// ----------------------------------------------------------------------------
+// ============================================================================
+// 3. Native PLT Hook (只针对 libandroid_runtime.so)
+// ============================================================================
+
 typedef int (*system_property_read_t)(const prop_info *, char *, char *);
 static system_property_read_t orig_system_property_read = NULL;
 
+typedef int (*system_property_get_t)(const char *, char *);
+static system_property_get_t orig_system_property_get = NULL;
+
+// 处理 read
 int my_system_property_read(const prop_info *pi, char *name, char *value) {
     int len = 0;
-    if (orig_system_property_read) {
-        // 先调用原始函数，系统会把 name 和 value 填好
-        len = orig_system_property_read(pi, name, value);
-    }
-
-    // 系统填好后，我们再根据 name 篡改 value
-    int new_len = try_replace_prop(name, value);
-    if (new_len != -1) {
-        return new_len;
+    if (orig_system_property_read) len = orig_system_property_read(pi, name, value);
+    
+    const char* replace = get_replacement(name);
+    if (replace) {
+        if (replace[0] == '\0') { value[0] = '\0'; return 0; }
+        strncpy(value, replace, 91);
+        value[91] = '\0';
+        return strlen(value);
     }
     return len;
 }
 
-// ----------------------------------------------------------------------------
-// Hook 3: __system_property_read_callback
-// 现代 C++ 库 (android::base::GetProperty) 使用
-// ----------------------------------------------------------------------------
-typedef void (*prop_callback_func)(void *cookie, const char *name, const char *value, uint32_t serial);
-typedef void (*system_property_read_callback_t)(const prop_info *pi, prop_callback_func callback, void *cookie);
-
-static system_property_read_callback_t orig_system_property_read_callback = NULL;
-static thread_local prop_callback_func g_orig_app_callback = nullptr;
-
-// 代理回调
-static void my_prop_proxy_callback(void *cookie, const char *name, const char *value, uint32_t serial) {
-    prop_callback_func app_callback = g_orig_app_callback;
-    if (!app_callback) return;
-
-    // 检查是否命中规则
-    const char* target_val = NULL;
-    bool matched = false;
-    for (size_t i = 0; i < RULE_COUNT; i++) {
-        if (strcmp(name, RULES[i].key) == 0) {
-            target_val = RULES[i].value;
-            matched = true;
-            break;
-        }
+// 处理 get
+int my_system_property_get(const char *name, char *value) {
+    int len = 0;
+    if (orig_system_property_get) len = orig_system_property_get(name, value);
+    
+    const char* replace = get_replacement(name);
+    if (replace) {
+        if (replace[0] == '\0') { value[0] = '\0'; return 0; }
+        strncpy(value, replace, 91);
+        value[91] = '\0';
+        return strlen(value);
     }
-
-    if (matched) {
-        if (target_val == NULL) {
-            app_callback(cookie, name, "", serial); // 隐藏
-        } else {
-            app_callback(cookie, name, target_val, serial); // 替换
-        }
-    } else {
-        app_callback(cookie, name, value, serial); // 透传
-    }
-}
-
-void my_system_property_read_callback(const prop_info *pi, prop_callback_func callback, void *cookie) {
-    if (orig_system_property_read_callback) {
-        g_orig_app_callback = callback;
-        orig_system_property_read_callback(pi, my_prop_proxy_callback, cookie);
-    }
+    return len;
 }
 
 // ============================================================================
 // 4. Zygisk 模块主体
 // ============================================================================
-class PropModule : public zygisk::ModuleBase {
+
+class FinalModule : public zygisk::ModuleBase {
 public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
         this->api = api;
         this->env = env;
-        // 绝对不要开启 DLCLOSE，否则安全库延迟调用时必崩
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+        // 1. 过滤 UID，保护系统进程
         if (args->uid < 10000) return;
-        hookAllLoadedModules();
+
+        // ---------------------------------------------------------
+        // 策略 A: JNI Hook (解决 Java 层读取，如 JuiceSSH)
+        // ---------------------------------------------------------
+        JNINativeMethod methods[] = {
+            { "native_get", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", (void*)my_native_get }
+        };
+        
+        api->hookJniNativeMethods(env, "android/os/SystemProperties", methods, 1);
+        if (methods[0].fnPtr) {
+            *(void **)&orig_native_get = methods[0].fnPtr;
+            LOGD("JNI Hook installed");
+        }
+
+        // ---------------------------------------------------------
+        // 策略 B: 精准 PLT Hook (解决底层库读取)
+        // 只 Hook "libandroid_runtime.so"，它是连接 Java 和 Native 的桥梁
+        // ---------------------------------------------------------
+        hookSpecificLib("libandroid_runtime.so");
     }
-    
-    void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override { }
+
+    void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {}
 
 private:
     zygisk::Api *api;
     JNIEnv *env;
 
-    // 检查路径是否在黑名单中
-    bool is_ignored_lib(const char* path) {
-        // 【关键黑名单】
-        // 这些库绝对不能 Hook，否则会崩溃或死锁
-        static const char* IGNORE_LIST[] = {
-            "libc.so",              // 自身
-            "zygisk",               // 模块自身
-            "libnativebridge.so",   // 系统桥接库 (崩溃日志中出现)
-            "libdl.so",             // 动态链接器
-            "libm.so",              // 数学库
-            "liblog.so",            // 日志库
-            
-            // 【风控/反作弊库】(根据崩溃日志添加)
-            "libmetasec_ml.so",     // 字节系风控
-            "libmsao.so",           // 另一常见的风控
-            "libixia.so",           // 阿里系/加固
-            "libjiagu.so",          // 360加固
-            "libnesec.so",          // 网易易盾
-            "libunwind.so"          // 栈回溯库
-        };
-
-        for (const char* item : IGNORE_LIST) {
-            if (strstr(path, item) != NULL) {
-                return true; // 在黑名单里，跳过
-            }
-        }
-        return false;
-    }
-
-    void hookAllLoadedModules() {
+    // 只 Hook 指定名称的库，极大提高稳定性！
+    void hookSpecificLib(const char* target_lib_name) {
         FILE *fp = fopen("/proc/self/maps", "r");
         if (fp == NULL) return;
 
@@ -236,31 +174,28 @@ private:
                                 &start, &end, perms, &offset, &dev_major, &dev_minor, &inode, path);
 
             if (fields == 8 && strstr(perms, "x") && inode != 0) {
-                
-                // 【核心修改】增加黑名单过滤
-                if (!is_ignored_lib(path)) {
+                // 核心逻辑：只匹配目标库名
+                if (strstr(path, target_lib_name) != NULL) {
                     
                     dev_t dev = makedev(dev_major, dev_minor);
-
-                    // 注册三个核心 Hook
-                    api->pltHookRegister(dev, inode, "__system_property_get", 
-                                        (void *)my_system_property_get, 
-                                        (void **)&orig_system_property_get);
-
+                    
+                    // Hook read (Android 12+)
                     api->pltHookRegister(dev, inode, "__system_property_read", 
                                         (void *)my_system_property_read, 
                                         (void **)&orig_system_property_read);
-
-                    api->pltHookRegister(dev, inode, "__system_property_read_callback", 
-                                        (void *)my_system_property_read_callback, 
-                                        (void **)&orig_system_property_read_callback);
+                                        
+                    // Hook get (兼容)
+                    api->pltHookRegister(dev, inode, "__system_property_get", 
+                                        (void *)my_system_property_get, 
+                                        (void **)&orig_system_property_get);
+                    
+                    LOGD("PLT Hook registered for %s", path);
                 }
             }
         }
         fclose(fp);
-
         api->pltHookCommit();
     }
 };
 
-REGISTER_ZYGISK_MODULE(PropModule)
+REGISTER_ZYGISK_MODULE(FinalModule)
