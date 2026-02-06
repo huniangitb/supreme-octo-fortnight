@@ -4,119 +4,130 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/types.h>
-#include <inttypes.h> // for SCNx64
-#include <sys/sysmacros.h>
+#include <sys/sysmacros.h> // 【关键】解决 makedev 未定义报错
+#include <inttypes.h>      // 用于 SCNxPTR 格式化打印
+
 #include "zygisk.hpp"
 
 // ============================================================================
-// 1. 配置区域
+// 1. 配置区域：规则定义
 // ============================================================================
 
-#define LOG_TAG "ZygiskPropHidden"
+#define LOG_TAG "ZygiskPropHook"
+// 仅在 Debug 模式打印日志，或者你可以保留 LOGI
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// 属性规则
 struct PropRule {
-    const char* key;
-    const char* value;
+    const char* key;    // 目标属性名
+    const char* value;  // 目标值 (NULL 代表隐藏/剔除)
 };
 
+// 【在此处修改你的规则】
 static const PropRule RULES[] = {
-    // 示例：规避检测
+    // 隐藏 Root/Debug 痕迹
     { "ro.build.tags", "release-keys" },
     { "ro.debuggable", "0" },
     { "ro.secure", "1" },
-    { "sys.usb.state", "mtp" },
-    { "ro.product.manufacturer", "Xiaomiyh" }, // 示例修改厂商
-    // 某些检测应用会查这个
-    { "ro.modversion", NULL } 
+    { "ro.adb.secure", "1" },
+    
+    // 模拟设备信息 (示例)
+    { "ro.product.manufacturer", "Xiaomi" },
+    { "ro.product.model", "Mi 11" },
+
+    // 剔除特定的 Hook 检测属性
+    { "ro.modversion", NULL },
+    { "example.detect.prop", NULL }
 };
 
 #define RULE_COUNT (sizeof(RULES) / sizeof(RULES[0]))
 
 // ============================================================================
-// 2. 业务逻辑 (保持不变)
+// 2. 业务逻辑 (纯 C 实现)
 // ============================================================================
 
+// 原始函数指针
 typedef int (*system_property_get_t)(const char *, char *);
 static system_property_get_t orig_system_property_get = NULL;
 
+// 我们的代理函数
 int my_system_property_get(const char *name, char *value) {
-    // 必须检查原始函数指针是否存在
-    // 如果是 PLT Hook，orig 指针可能在第一次调用时才被填充，
-    // 但 Zygisk 的实现通常会在 Register 时填充。
     int len = 0;
+    
+    // 1. 先尝试调用原始函数获取真实值
     if (orig_system_property_get) {
         len = orig_system_property_get(name, value);
-    } else {
-        // 极少情况下的回退逻辑，通常不会发生
-        return 0;
     }
-
+    
+    // 安全检查
     if (name == NULL || value == NULL) return len;
 
+    // 2. 遍历规则表
     for (size_t i = 0; i < RULE_COUNT; i++) {
+        // 使用 strcmp 比较 (纯 C 库)
         if (strcmp(name, RULES[i].key) == 0) {
             const char* target_val = RULES[i].value;
+            
             if (target_val == NULL) {
+                // 策略：隐藏 (模拟属性不存在)
                 value[0] = '\0';
-                return 0;
+                // LOGI("[HIDE] %s", name);
+                return 0; 
             } else {
+                // 策略：替换
+                // 91 是为了防止缓冲区溢出 (PROP_VALUE_MAX 通常为 92)
                 strncpy(value, target_val, 91);
                 value[91] = '\0';
+                // LOGI("[REPLACE] %s -> %s", name, value);
                 return (int)strlen(value);
             }
         }
     }
+
     return len;
 }
 
 // ============================================================================
-// 3. Zygisk 模块 (使用 PLT Hook)
+// 3. Zygisk 模块主体 (PLT Hook + 隐身)
 // ============================================================================
 
-class PropHiddenModule : public zygisk::ModuleBase {
+class PropModule : public zygisk::ModuleBase {
 public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
         this->api = api;
         this->env = env;
         
-        // 【关键策略 1】: 隐藏模块自身
-        // 模块代码执行完毕后，从内存映射中移除模块的 .so 记录
-        // 这样检测应用扫描 /proc/self/maps 时就看不到你的模块了
+        // 【关键隐身】: 告诉 Zygisk 在 Hook 完成后，把本模块从内存映射中移除
+        // 这样检测应用扫描 /proc/self/maps 时找不到此模块
         api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        // 过滤系统应用
-        if (args->uid < 10000) return;
+        // 1. 规避系统应用 (UID < 10000)
+        if (args->uid < 10000) {
+            return;
+        }
 
-        LOGI("App UID: %d, Preparing PLT hooks...", args->uid);
-
-        // 【关键策略 2】: 使用 PLT Hook 代替 Inline Hook
-        // 我们需要遍历当前加载的所有动态库，Hook 它们对 __system_property_get 的引用
-        hookAllModules();
+        // 2. 注册 PLT Hook
+        // 这一步会遍历内存映射，Hook 所有加载的库对 __system_property_get 的引用
+        hookAllLoadedModules();
     }
-
-    void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        // PLT Hook 需要在 specialize 之后再次确保生效（针对部分动态加载的情况）
-        // 但通常 preAppSpecialize 足够覆盖启动时的检测
-    }
+    
+    // PLT Hook 需要尽早注册，postAppSpecialize 通常不需要操作
+    void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override { }
 
 private:
     zygisk::Api *api;
     JNIEnv *env;
 
-    // 解析 /proc/self/maps 并注册 PLT Hook
-    void hookAllModules() {
+    // 解析 /proc/self/maps 并批量注册 Hook
+    void hookAllLoadedModules() {
         FILE *fp = fopen("/proc/self/maps", "r");
         if (fp == NULL) return;
 
         char line[512];
         while (fgets(line, sizeof(line), fp)) {
-            // map line format: 
-            // 7f89a00000-7f89a01000 r-xp 00000000 fd:00 12345  /system/lib64/libutils.so
+            // 解析 maps 文件的每一行
+            // 格式示例: 7f89a00000-7f89a01000 r-xp 00000000 fd:00 12345  /system/lib64/libutils.so
             
             uintptr_t start, end;
             char perms[5];
@@ -125,38 +136,34 @@ private:
             unsigned long inode;
             char path[256];
 
-            // 使用 sscanf 解析关键字段：dev(设备号) 和 inode(节点号) 是 Zygisk 识别文件的关键
-            // 注意：%s 读取 path 可能会因为空格截断，但系统库通常无空格
             int fields = sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s %" SCNx64 " %x:%x %lu %s",
                                 &start, &end, perms, &offset, &dev_major, &dev_minor, &inode, path);
 
-            // 1. 必须是可执行段 (r-xp)
-            if (strstr(perms, "x")) {
-                // 2. 排除 [anon] 内存段，必须关联到文件
-                if (fields == 8 && inode != 0) {
-                    // 构建 dev_t
+            // 筛选条件：
+            // 1. r-xp: 可读可执行 (代码段)
+            // 2. inode != 0: 必须是文件映射
+            if (fields == 8 && strstr(perms, "x") && inode != 0) {
+                
+                // 排除 libc.so 自身 (防止递归调用或死锁)
+                // 以及排除我们自己的模块 (虽然我们会自我卸载，但排除一下更安全)
+                if (strstr(path, "libc.so") == NULL && strstr(path, "zygisk") == NULL) {
+                    
+                    // 生成设备 ID
                     dev_t dev = makedev(dev_major, dev_minor);
 
-                    // 3. 注册 Hook
-                    // 注意：不要 Hook libc.so 自己调用自己（虽然 PLT 也可以），主要是 Hook 其他库
-                    // 如果路径包含 libc.so，通常跳过，防止递归死锁或异常
-                    if (strstr(path, "libc.so") == NULL) {
-                         api->pltHookRegister(dev, inode, "__system_property_get", 
-                                             (void *)my_system_property_get, 
-                                             (void **)&orig_system_property_get);
-                    }
+                    // 向 Zygisk 注册 PLT Hook
+                    // 含义：当这个库(dev/inode)调用 "__system_property_get" 时，拦截它
+                    api->pltHookRegister(dev, inode, "__system_property_get", 
+                                        (void *)my_system_property_get, 
+                                        (void **)&orig_system_property_get);
                 }
             }
         }
         fclose(fp);
 
-        // 提交所有 Hook
-        if (api->pltHookCommit()) {
-            LOGI("PLT Hooks committed successfully.");
-        } else {
-            LOGE("PLT Hooks commit failed.");
-        }
+        // 提交所有注册的 Hook
+        api->pltHookCommit();
     }
 };
 
-REGISTER_ZYGISK_MODULE(PropHiddenModule)
+REGISTER_ZYGISK_MODULE(PropModule)
