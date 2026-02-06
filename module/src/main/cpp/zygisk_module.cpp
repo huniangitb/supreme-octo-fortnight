@@ -8,17 +8,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
-#include <dlfcn.h>
 #include <fcntl.h>
-#include <linux/limits.h>
-#include <stdarg.h>
 #include <stdlib.h>
 #include <stdbool.h>
-#include <pthread.h>
-#include <ctype.h>
 
 #include "zygisk.hpp"
 
+// 使用 LOG 定义，确保日志输出
 #define LOG_TAG "Zygisk_NSProxy"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "[ERROR] " __VA_ARGS__)
@@ -27,155 +23,156 @@
 static const char* INJECTOR_SOCKET_PATH = "/data/Namespace-Proxy/ipc.sock";
 
 // ==========================================
-// 辅助函数
+// 纯 C 辅助函数
 // ==========================================
 
-// 判断是否为目标进程（可以根据需求修改，或者直接返回 true 以支持所有应用）
 static bool is_target_process(const char* name) {
-    if (!name) return false;
-    // 默认保留原有的媒体进程过滤，如果需要上报所有应用，请直接返回 true
+    if (name == NULL) return false;
+    
+    // 目标进程列表
     const char* targets[] = {
         "com.android.providers.media",
         "android.process.media",
         "com.google.android.providers.media",
         "com.android.providers.media.module"
     };
-    for (size_t i = 0; i < sizeof(targets)/sizeof(targets[0]); i++) {
-        if (strstr(name, targets[i])) return true;
+    
+    size_t num_targets = sizeof(targets) / sizeof(targets[0]);
+    for (size_t i = 0; i < num_targets; i++) {
+        if (strstr(name, targets[i]) != NULL) {
+            return true;
+        }
     }
     return false;
 }
 
 // ==========================================
-// Companion (Root 权限运行)
+// Companion (以 Root 权限在独立进程运行)
 // ==========================================
-// 此函数在 root 进程中运行，负责转发 App 的请求给 Injector 守护进程
 
 static void companion_handler(int client_fd) {
     char buf[1024];
-    // 1. 读取 App 发来的请求 (格式: "REQ pkg_name pid")
+    // 1. 读取来自 App 进程的请求
     ssize_t len = read(client_fd, buf, sizeof(buf) - 1);
-    if (len <= 0) { 
-        close(client_fd); 
-        return; 
-    }
-    buf[len] = '\0';
-    
-    char pkg_name[256];
-    int pid = 0;
-    if (sscanf(buf, "REQ %255s %d", pkg_name, &pid) != 2) {
-        LOGE("Companion: 请求格式解析失败: %s", buf);
-        close(client_fd); 
+    if (len <= 0) {
+        close(client_fd);
         return;
     }
-    
-    LOGI("Companion: 准备上报进程: %s (PID: %d)", pkg_name, pid);
+    buf[len] = '\0';
 
-    // 2. 连接外部 Injector Socket 并发送 REPORT
+    char pkg_name[256];
+    int pid = 0;
+    // 解析指令 "REQ <package> <pid>"
+    if (sscanf(buf, "REQ %255s %d", pkg_name, &pid) != 2) {
+        LOGE("Companion: 无法解析请求内容: %s", buf);
+        close(client_fd);
+        return;
+    }
+
+    LOGI("Companion: 收到上报请求 - App: %s, PID: %d", pkg_name, pid);
+
+    // 2. 连接 Injector 的 Unix Domain Socket
     int inj_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (inj_fd >= 0) {
-        struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    if (inj_fd < 0) {
+        LOGE("Companion: 创建 Socket 失败: %s", strerror(errno));
+    } else {
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
         strncpy(addr.sun_path, INJECTOR_SOCKET_PATH, sizeof(addr.sun_path) - 1);
-        
-        // 设置短超时
-        struct timeval tv = { .tv_sec = 1, .tv_usec = 500000 }; 
+
+        // 设置连接和读写超时（1.5秒）
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 500000;
         setsockopt(inj_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(inj_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        
+
         if (connect(inj_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-            char report[512];
-            snprintf(report, sizeof(report), "REPORT %s %d", pkg_name, pid);
+            char report_msg[512];
+            int msg_len = snprintf(report_msg, sizeof(report_msg), "REPORT %s %d", pkg_name, pid);
             
-            if (write(inj_fd, report, strlen(report)) > 0) {
-                LOGD("Companion: 已向 Injector 发送 REPORT 指令");
+            if (write(inj_fd, report_msg, msg_len) > 0) {
+                LOGD("Companion: 已成功转发 REPORT 给 Injector");
                 
-                // 等待 Injector 确认（可选）
-                char resp[32];
-                ssize_t n = read(inj_fd, resp, sizeof(resp) - 1);
-                if (n > 0) {
-                    resp[n] = '\0';
-                    LOGD("Companion: Injector 响应: %s", resp);
-                }
+                // 尝试读取一次确认（防止 Injector 还没处理完连接就断了）
+                char dummy_resp[16];
+                read(inj_fd, dummy_resp, sizeof(dummy_resp));
+            } else {
+                LOGE("Companion: 转发 REPORT 失败: %s", strerror(errno));
             }
         } else {
-            LOGE("Companion: 无法连接 Injector (%s): %s", INJECTOR_SOCKET_PATH, strerror(errno));
+            LOGE("Companion: 连接 Injector 失败 (%s): %s", INJECTOR_SOCKET_PATH, strerror(errno));
         }
         close(inj_fd);
-    } else {
-        LOGE("Companion: 创建 Socket 失败: %s", strerror(errno));
     }
-    
-    // 3. 回复 App 表示处理完成
-    const char* ack = "OK";
-    write(client_fd, ack, strlen(ack));
+
+    // 3. 告知 App 进程 Companion 已处理完毕
+    const char* ok_msg = "DONE";
+    write(client_fd, ok_msg, strlen(ok_msg));
     close(client_fd);
 }
 
 // ==========================================
-// Zygisk Module (App 进程运行)
+// Zygisk Module (在 App 进程中运行)
 // ==========================================
 
 class AppReporterModule : public zygisk::ModuleBase {
 public:
-    void onLoad(zygisk::Api *api, JNIEnv *env) override { 
-        this->api = api; 
-        this->env = env; 
+    // 虽然是类成员，但内部全部使用 C 逻辑
+    void onLoad(zygisk::Api *api, JNIEnv *env) override {
+        this->api = api;
+        this->env = env;
     }
-    
+
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        // 获取进程名
-        const char* proc_raw = nullptr;
-        if (args->nice_name) proc_raw = env->GetStringUTFChars(args->nice_name, nullptr);
-        
-        char* pkg = proc_raw ? strdup(proc_raw) : strdup("unknown");
-        int my_pid = getpid();
-        
-        if (proc_raw) env->ReleaseStringUTFChars(args->nice_name, proc_raw);
+        if (args->nice_name == NULL) return;
 
-        // 过滤是否需要上报
-        if (!is_target_process(pkg)) {
-            free(pkg);
-            return;
-        }
+        // C 风格 JNI 调用获取包名
+        const char* nice_name_c = env->GetStringUTFChars(args->nice_name, NULL);
+        if (nice_name_c == NULL) return;
 
-        LOGI("App [%s]: 启动上报流程...", pkg);
+        // 仅针对目标进程进行上报
+        if (is_target_process(nice_name_c)) {
+            int my_pid = getpid();
+            LOGI("App [%s]: 准备向 Companion 上报...", nice_name_c);
 
-        // 通过 Companion 进行上报
-        int fd = api->connectCompanion();
-        if (fd >= 0) {
-            char req[512];
-            snprintf(req, sizeof(req), "REQ %s %d", pkg, my_pid);
-            
-            if (write(fd, req, strlen(req)) > 0) {
-                // 等待 Companion 完成处理（避免同步问题）
-                struct pollfd pfd = { .fd = fd, .events = POLLIN };
-                if (poll(&pfd, 1, 2000) > 0) {
-                    LOGI("App [%s]: 上报成功", pkg);
-                } else {
-                    LOGE("App [%s]: 上报超时", pkg);
+            // 连接 Companion
+            int fd = api->connectCompanion();
+            if (fd >= 0) {
+                char req_buf[512];
+                int req_len = snprintf(req_buf, sizeof(req_buf), "REQ %s %d", nice_name_c, my_pid);
+                
+                if (write(fd, req_buf, req_len) > 0) {
+                    // 使用 poll 阻塞等待 Companion 完成转发逻辑
+                    struct pollfd pfd;
+                    pfd.fd = fd;
+                    pfd.events = POLLIN;
+                    if (poll(&pfd, 1, 2000) > 0) {
+                        LOGI("App [%s]: 上报流程结束", nice_name_c);
+                    } else {
+                        LOGE("App [%s]: 上报等待超时", nice_name_c);
+                    }
                 }
+                close(fd);
             } else {
-                LOGE("App [%s]: 写入 Companion 失败: %s", pkg, strerror(errno));
+                LOGE("App [%s]: 无法连接 Companion", nice_name_c);
             }
-            close(fd);
-        } else {
-            LOGE("App [%s]: 无法连接 Companion", pkg);
         }
-        
-        free(pkg);
+
+        env->ReleaseStringUTFChars(args->nice_name, nice_name_c);
     }
-    
+
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        // 由于不再需要 Hook 逻辑，上报完成后可以卸载该库以节省资源
-        // 如果你需要后续的定时轮询（Hot Reload），请删除下面这一行
+        // 上报完成后立即卸载模块库，释放内存，并确保不留下任何 Hook
         api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }
-    
+
 private:
     zygisk::Api *api;
     JNIEnv *env;
 };
 
-// 注册 Zygisk 模块和 Companion 处理函数
+// 宏定义会处理必要的 C/C++ 导出符号
 REGISTER_ZYGISK_MODULE(AppReporterModule)
 REGISTER_ZYGISK_COMPANION(companion_handler)
