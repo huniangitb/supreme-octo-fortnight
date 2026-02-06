@@ -24,7 +24,7 @@ static const PropRule RULES[] = {
     { "ro.debuggable", "0" },
     { "ro.secure", "1" },
     { "sys.usb.state", "mtp" },
-    // { "ro.product.manufacturer", "Xiaomi" }, // 可选
+    { "ro.product.manufacturer", "Xiaomdjji" }, // 可选
     // { "ro.modversion", NULL } // 可选：隐藏
 };
 
