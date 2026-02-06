@@ -6,18 +6,18 @@
 #include <sys/types.h>
 #include <sys/sysmacros.h>
 #include <inttypes.h>
-#include <sys/system_properties.h> // 需要 prop_info 定义
+#include <sys/system_properties.h>
 
 #include "zygisk.hpp"
 
 // ============================================================================
-// 1. 配置规则
+// 1. 规则配置
 // ============================================================================
 
-#define LOG_TAG "ZygiskPropHook"
-// 调试时可以开启 Log，生产环境建议关闭以防刷屏
-// #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
-#define LOGD(...) 
+#define LOG_TAG "ZygiskPropCore"
+// 调试开关：生产环境请注释掉 LOGD
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+//#define LOGD(...) 
 
 struct PropRule {
     const char* key;
@@ -26,33 +26,65 @@ struct PropRule {
 
 // 【在此配置你的规则】
 static const PropRule RULES[] = {
+    // 基础指纹模拟
     { "ro.build.tags", "release-keys" },
+    { "ro.build.type", "user" },
     { "ro.debuggable", "0" },
     { "ro.secure", "1" },
+    { "ro.adb.secure", "1" },
     { "sys.usb.state", "mtp" },
-    { "ro.product.manufacturer", "Google" },
-    // 针对特定检测的属性
-    { "ro.modversion", NULL } 
+    
+    // 厂商伪装
+    { "ro.product.manufacturer", "Xiaomi" },
+    { "ro.product.brand", "Xiaomi" },
+    { "ro.product.model", "Mi 11" },
+    
+    // 针对特定检测的隐藏
+    { "ro.modversion", NULL },
+    { "ro.magisk.deny.mount", NULL }
 };
 
 #define RULE_COUNT (sizeof(RULES) / sizeof(RULES[0]))
 
-// 辅助函数：查找规则
-// 返回 NULL 表示未命中，否则返回目标值(可能为NULL表示剔除)
-static const char* find_replacement(const char* name) {
-    if (name == NULL) return nullptr;
+// ============================================================================
+// 2. 核心逻辑: 通用替换处理
+// ============================================================================
+
+// 统一的处理逻辑：检查 name，如果在规则中，则修改 value
+// 返回值：新的 value 长度；如果未修改则返回 -1
+static int try_replace_prop(const char *name, char *value) {
+    if (name == NULL || value == NULL) return -1;
+
     for (size_t i = 0; i < RULE_COUNT; i++) {
         if (strcmp(name, RULES[i].key) == 0) {
-            return RULES[i].value;
+            const char* target_val = RULES[i].value;
+            
+            if (target_val == NULL) {
+                // 策略：隐藏 (置空)
+                value[0] = '\0';
+                LOGD("Hiding prop: %s", name);
+                return 0;
+            } else {
+                // 策略：替换
+                // PROP_VALUE_MAX = 92, 安全起见用 91
+                strncpy(value, target_val, 91);
+                value[91] = '\0';
+                LOGD("Replacing prop: %s -> %s", name, target_val);
+                return (int)strlen(value);
+            }
         }
     }
-    return nullptr; // 使用 nullptr 区分"未命中"
+    return -1; // 未命中
 }
 
 // ============================================================================
-// 2. Hook 逻辑 - PART A: __system_property_get (传统方式)
+// 3. Hook 函数定义 (覆盖 Android 12+ 三种读取路径)
 // ============================================================================
 
+// ----------------------------------------------------------------------------
+// Hook 1: __system_property_get
+// 最传统的 API，部分老应用和 Shell 命令使用
+// ----------------------------------------------------------------------------
 typedef int (*system_property_get_t)(const char *, char *);
 static system_property_get_t orig_system_property_get = NULL;
 
@@ -62,52 +94,54 @@ int my_system_property_get(const char *name, char *value) {
         len = orig_system_property_get(name, value);
     }
     
-    // 查找是否命中规则（复用查找逻辑）
-    // 注意：这里我们重新遍历一次，因为原始值可能并不是我们想要的
-    // 如果 name 在规则表中，直接覆盖
-    for (size_t i = 0; i < RULE_COUNT; i++) {
-        if (strcmp(name, RULES[i].key) == 0) {
-            const char* target_val = RULES[i].value;
-            if (target_val == NULL) {
-                value[0] = '\0';
-                return 0;
-            } else {
-                strncpy(value, target_val, 91);
-                value[91] = '\0';
-                return (int)strlen(value);
-            }
-        }
+    int new_len = try_replace_prop(name, value);
+    if (new_len != -1) {
+        return new_len;
     }
     return len;
 }
 
-// ============================================================================
-// 3. Hook 逻辑 - PART B: __system_property_read_callback (现代方式)
-// ============================================================================
+// ----------------------------------------------------------------------------
+// Hook 2: __system_property_read
+// 【关键】Android 12+ Java 层 SystemProperties.get() 底层常走此路
+// 签名: int __system_property_read(const prop_info *pi, char *name, char *value);
+// ----------------------------------------------------------------------------
+typedef int (*system_property_read_t)(const prop_info *, char *, char *);
+static system_property_read_t orig_system_property_read = NULL;
 
-// 定义回调函数的函数指针类型
+int my_system_property_read(const prop_info *pi, char *name, char *value) {
+    int len = 0;
+    if (orig_system_property_read) {
+        // 先调用原始函数，系统会把 name 和 value 填好
+        len = orig_system_property_read(pi, name, value);
+    }
+
+    // 系统填好后，我们再根据 name 篡改 value
+    int new_len = try_replace_prop(name, value);
+    if (new_len != -1) {
+        return new_len;
+    }
+    return len;
+}
+
+// ----------------------------------------------------------------------------
+// Hook 3: __system_property_read_callback
+// 现代 C++ 库 (android::base::GetProperty) 使用
+// ----------------------------------------------------------------------------
 typedef void (*prop_callback_func)(void *cookie, const char *name, const char *value, uint32_t serial);
-
-// 定义原始 read_callback 函数类型
 typedef void (*system_property_read_callback_t)(const prop_info *pi, prop_callback_func callback, void *cookie);
-static system_property_read_callback_t orig_system_property_read_callback = NULL;
 
-// 【关键技术点】: 线程局部存储 (Thread Local Storage)
-// 因为 read_callback 是异步回调，我们不能通过参数传递原始的 callback。
-// 使用 thread_local 保证多线程并发读取属性时，不会串台。
+static system_property_read_callback_t orig_system_property_read_callback = NULL;
 static thread_local prop_callback_func g_orig_app_callback = nullptr;
 
-// 我们的代理回调：系统读到底层真实值后，会调用这个函数
+// 代理回调
 static void my_prop_proxy_callback(void *cookie, const char *name, const char *value, uint32_t serial) {
-    // 1. 获取应用原本想要的回调函数
     prop_callback_func app_callback = g_orig_app_callback;
     if (!app_callback) return;
 
-    // 2. 检查是否需要替换
+    // 检查是否命中规则
     const char* target_val = NULL;
     bool matched = false;
-    
-    // 遍历规则
     for (size_t i = 0; i < RULE_COUNT; i++) {
         if (strcmp(name, RULES[i].key) == 0) {
             target_val = RULES[i].value;
@@ -118,32 +152,21 @@ static void my_prop_proxy_callback(void *cookie, const char *name, const char *v
 
     if (matched) {
         if (target_val == NULL) {
-            // 策略：隐藏。传空字符串或者直接拦截不回调？
-            // 通常传空字符串比较安全，直接不回调可能导致 App 逻辑卡死
-            app_callback(cookie, name, "", serial);
-            LOGD("read_callback: HIDDEN %s", name);
+            app_callback(cookie, name, "", serial); // 隐藏
         } else {
-            // 策略：替换
-            app_callback(cookie, name, target_val, serial);
-            LOGD("read_callback: REPLACED %s -> %s", name, target_val);
+            app_callback(cookie, name, target_val, serial); // 替换
         }
     } else {
-        // 未命中，透传原始值
-        app_callback(cookie, name, value, serial);
+        app_callback(cookie, name, value, serial); // 透传
     }
 }
 
-// 我们的 Hook 入口
 void my_system_property_read_callback(const prop_info *pi, prop_callback_func callback, void *cookie) {
     if (orig_system_property_read_callback) {
-        // 1. 保存 App 原始的回调函数到 TLS
         g_orig_app_callback = callback;
-        
-        // 2. 调用原始系统函数，但把回调替换成我们的代理函数 (my_prop_proxy_callback)
         orig_system_property_read_callback(pi, my_prop_proxy_callback, cookie);
     }
 }
-
 
 // ============================================================================
 // 4. Zygisk 模块主体
@@ -158,9 +181,10 @@ public:
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         // 1. 过滤系统应用 (UID < 10000)
+        // 保持系统稳定性，不修改系统进程属性
         if (args->uid < 10000) return;
 
-        // 2. 执行 PLT Hook
+        // 2. 批量 PLT Hook
         hookAllLoadedModules();
     }
     
@@ -186,19 +210,26 @@ private:
             int fields = sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s %" SCNx64 " %x:%x %lu %s",
                                 &start, &end, perms, &offset, &dev_major, &dev_minor, &inode, path);
 
+            // 筛选条件：可执行段(x) + 文件映射(inode!=0)
             if (fields == 8 && strstr(perms, "x") && inode != 0) {
-                // 排除 libc.so 自身 (防止递归) 和 模块自身
+                // 排除 libc.so (防止自递归) 和 zygisk模块自身
                 if (strstr(path, "libc.so") == NULL && strstr(path, "zygisk") == NULL) {
                     
                     dev_t dev = makedev(dev_major, dev_minor);
 
-                    // Hook 1: 传统的 get (Android 7 及以下为主，部分老代码)
+                    // --- 注册三个核心 Hook ---
+                    
+                    // 1. get (Legacy)
                     api->pltHookRegister(dev, inode, "__system_property_get", 
                                         (void *)my_system_property_get, 
                                         (void **)&orig_system_property_get);
 
-                    // Hook 2: 现代的 read_callback (Android 8+ / API 26+)
-                    // 这是大多数通过 C++ (libbase) 或 Java (SystemProperties) 访问属性的底层入口
+                    // 2. read (Core for Android 12+ Java/JNI)
+                    api->pltHookRegister(dev, inode, "__system_property_read", 
+                                        (void *)my_system_property_read, 
+                                        (void **)&orig_system_property_read);
+
+                    // 3. read_callback (Modern C++)
                     api->pltHookRegister(dev, inode, "__system_property_read_callback", 
                                         (void *)my_system_property_read_callback, 
                                         (void **)&orig_system_property_read_callback);
@@ -207,6 +238,7 @@ private:
         }
         fclose(fp);
 
+        // 提交所有 Hook
         api->pltHookCommit();
     }
 };
