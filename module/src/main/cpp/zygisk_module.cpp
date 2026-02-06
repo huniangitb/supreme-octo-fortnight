@@ -19,394 +19,43 @@
 
 #include "zygisk.hpp"
 
-// 1. 包裹 Dobby 头文件引用
-#ifdef USE_DOBBY
-#include "dobby.h"
-#endif
-
 #define LOG_TAG "Zygisk_NSProxy"
-// 定义带文件行号的日志宏，方便定位错误
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "[ERROR] " __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOG_TRACE(msg) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, "[Trace] %s", msg)
 
 static const char* INJECTOR_SOCKET_PATH = "/data/Namespace-Proxy/ipc.sock";
-static const char* RULES_FILE_PATH = "/data/Namespace-Proxy/zygisk_rules.conf";
-static bool is_valid_rule(const char* source, const char* target);
-// ==========================================
-// 数据结构与全局变量
-// ==========================================
-
-typedef struct RedirectRule {
-    char* source;
-    char* target;
-} RedirectRule;
-
-typedef struct RuleList {
-    RedirectRule* rules;
-    size_t count;
-    size_t capacity;
-} RuleList;
-
-static RuleList g_rules = {0};
-static pthread_mutex_t g_rules_mutex = PTHREAD_MUTEX_INITIALIZER;
-static bool g_hooks_installed = false;
-static __thread bool g_is_hooking = false;
-
-// 原始函数指针
-static int (*orig_openat)(int dirfd, const char *pathname, int flags, ...);
-static int (*orig_mkdirat)(int dirfd, const char *pathname, mode_t mode);
-static int (*orig_faccessat)(int dirfd, const char *pathname, int mode, int flags);
-static int (*orig_fstatat)(int dirfd, const char *pathname, struct stat *buf, int flags);
-static int (*orig_access)(const char *pathname, int mode);
-static int (*orig_stat)(const char *pathname, struct stat *buf);
-static int (*orig_lstat)(const char *pathname, struct stat *buf);
-struct linux_dirent64 { uint64_t d_ino; int64_t d_off; unsigned short d_reclen; unsigned char d_type; char d_name[]; };
-static int (*orig_getdents64)(unsigned int fd, struct linux_dirent64 *dirp, unsigned int count);
 
 // ==========================================
 // 辅助函数
 // ==========================================
 
-static char* normalize_path(const char* p) {
-    if (!p || p[0] == '\0') {
-        char* empty = (char*)malloc(1);
-        if (empty) empty[0] = '\0';
-        return empty;
-    }
-    size_t len = strlen(p);
-    while (len > 1 && p[len - 1] == '/') len--;
-    char* result = (char*)malloc(len + 1);
-    if (!result) return NULL;
-    strncpy(result, p, len);
-    result[len] = '\0';
-    return result;
-}
-
-static bool is_target_media_process(const char* name) {
+// 判断是否为目标进程（可以根据需求修改，或者直接返回 true 以支持所有应用）
+static bool is_target_process(const char* name) {
     if (!name) return false;
-    const char* media_processes[] = {
+    // 默认保留原有的媒体进程过滤，如果需要上报所有应用，请直接返回 true
+    const char* targets[] = {
         "com.android.providers.media",
         "android.process.media",
         "com.google.android.providers.media",
         "com.android.providers.media.module"
     };
-    for (size_t i = 0; i < sizeof(media_processes)/sizeof(media_processes[0]); i++) {
-        if (strstr(name, media_processes[i])) return true;
+    for (size_t i = 0; i < sizeof(targets)/sizeof(targets[0]); i++) {
+        if (strstr(name, targets[i])) return true;
     }
     return false;
 }
 
 // ==========================================
-// 规则管理
+// Companion (Root 权限运行)
 // ==========================================
-
-static void clear_rule_list(RuleList* list) {
-    if (list->rules) {
-        for (size_t i = 0; i < list->count; i++) {
-            free(list->rules[i].source);
-            free(list->rules[i].target);
-        }
-        free(list->rules);
-    }
-    list->rules = NULL;
-    list->count = 0;
-    list->capacity = 0;
-}
-
-static bool add_rule(RuleList* list, const char* source, const char* target) {
-    // 双重保险：再次校验
-    if (!is_valid_rule(source, target)) {
-        return false;
-    }
-
-    if (list->count >= list->capacity) {
-        size_t new_capacity = list->capacity == 0 ? 8 : list->capacity * 2;
-        RedirectRule* new_rules = (RedirectRule*)realloc(list->rules, new_capacity * sizeof(RedirectRule));
-        if (!new_rules) return false;
-        list->rules = new_rules;
-        list->capacity = new_capacity;
-    }
-    RedirectRule* rule = &list->rules[list->count++];
-    rule->source = strdup(source);
-    rule->target = target ? strdup(target) : NULL;
-    return true;
-}
-
-// ==========================================
-// 规则校验与管理
-// ==========================================
-
-// [新增] 校验规则合法性
-static bool is_valid_rule(const char* source, const char* target) {
-    if (!source || !target) return false;
-
-    // 1. 基础非空检查
-    if (source[0] == '\0' || target[0] == '\0') {
-        return false;
-    }
-
-    // 2. 必须是绝对路径
-    if (source[0] != '/' || target[0] != '/') {
-        LOGE("[规则忽略] 路径必须以 / 开头 (非绝对路径): %s -> %s", source, target);
-        return false;
-    }
-
-    // 3. 防止源和目标相同 (无意义且浪费性能)
-    if (strcmp(source, target) == 0) {
-        LOGE("[规则忽略] 源路径与目标路径完全相同: %s", source);
-        return false;
-    }
-
-    // 4. [关键] 防止递归重定向 (目标路径包含源路径)
-    // 例如: /storage/emulated/0 -> /storage/emulated/0/SubDir
-    // 这会导致无限循环，是导致你日志崩溃的元凶
-    size_t src_len = strlen(source);
-    if (strncmp(target, source, src_len) == 0) {
-        // 确保匹配的是完整目录名，例如 /a -> /ab 是合法的，但 /a -> /a/b 是非法的
-        if (target[src_len] == '/' || target[src_len] == '\0') {
-            LOGE("[规则忽略] 检测到递归死循环 (目标是源的子目录): %s -> %s", source, target);
-            return false;
-        }
-    }
-
-    return true;
-}
-
-static void parse_rules_string(const char* raw_data) {
-    if (!raw_data) return;
-    if (strncmp(raw_data, "SET_RULES:", 10) != 0) {
-        LOGE("规则格式错误，头部不匹配: %.20s...", raw_data);
-        return;
-    }
-    
-    const char* data = raw_data + 10;
-    RuleList new_rules = {0};
-    int added_count = 0;
-    int ignored_count = 0;
-    
-    const char* start = data;
-    while (*start) {
-        const char* end = strchr(start, ',');
-        if (!end) end = start + strlen(start);
-        
-        char* pipe = (char*)memchr(start, '|', end - start);
-        if (pipe) {
-            size_t src_len = pipe - start;
-            char* src = (char*)malloc(src_len + 1);
-            strncpy(src, start, src_len); src[src_len] = '\0';
-            
-            size_t dst_len = end - (pipe + 1);
-            char* dst = (char*)malloc(dst_len + 1);
-            strncpy(dst, pipe + 1, dst_len); dst[dst_len] = '\0';
-            
-            // 归一化处理（去除末尾斜杠）
-            char *n_src = normalize_path(src);
-            char *n_dst = normalize_path(dst);
-            
-            // 在这里进行校验
-            if (is_valid_rule(n_src, n_dst)) {
-                if (add_rule(&new_rules, n_src, n_dst)) {
-                    added_count++;
-                }
-            } else {
-                ignored_count++;
-            }
-            
-            free(src); free(dst);
-            free(n_src); free(n_dst);
-        }
-        if (*end == '\0') break;
-        start = end + 1;
-    }
-    
-    pthread_mutex_lock(&g_rules_mutex);
-    clear_rule_list(&g_rules);
-    g_rules = new_rules;
-    size_t total_count = g_rules.count;
-    pthread_mutex_unlock(&g_rules_mutex);
-    
-    LOGI("规则加载完毕。生效: %d 条，忽略非法规则: %d 条", added_count, ignored_count);
-}
-
-// 核心路径匹配逻辑
-static char* get_redirected_path(const char* pathname) {
-    if (!pathname || pathname[0] != '/') return NULL;
-    // 简单优化：只处理 /storage 开头
-    if (strncmp(pathname, "/storage", 8) != 0) return NULL;
-    
-    char* current = normalize_path(pathname);
-    if (!current) return NULL;
-    
-    char* result = NULL;
-    pthread_mutex_lock(&g_rules_mutex);
-    
-    for (size_t i = 0; i < g_rules.count; i++) {
-        RedirectRule* rule = &g_rules.rules[i];
-        
-        // 精确匹配
-        if (strcmp(current, rule->source) == 0) {
-            result = strdup(rule->target);
-            break;
-        }
-        
-        // 目录前缀匹配
-        size_t slen = strlen(rule->source);
-        if (strncmp(current, rule->source, slen) == 0 && current[slen] == '/') {
-            size_t rlen = strlen(rule->target) + strlen(current + slen) + 1;
-            result = (char*)malloc(rlen);
-            snprintf(result, rlen, "%s%s", rule->target, current + slen);
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_rules_mutex);
-    
-    if (result) {
-        LOGD("[规则命中] %s -> %s", current, result);
-    }
-    
-    free(current);
-    return result;
-}
-
-// ==========================================
-// Hook 实现
-// ==========================================
-
-static int fake_openat(int dirfd, const char *pathname, int flags, ...) {
-    mode_t mode = 0;
-    if ((flags & O_CREAT) || (flags & O_TMPFILE)) {
-        va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap);
-    }
-    if (g_is_hooking) return orig_openat(dirfd, pathname, flags, mode);
-    g_is_hooking = true;
-    char* r = get_redirected_path(pathname);
-    int ret = orig_openat(dirfd, r ? r : pathname, flags, mode);
-    if (r) free(r);
-    g_is_hooking = false;
-    return ret;
-}
-
-static int fake_faccessat(int dirfd, const char *pathname, int mode, int flags) {
-    if (g_is_hooking) return orig_faccessat(dirfd, pathname, mode, flags);
-    g_is_hooking = true;
-    char* r = get_redirected_path(pathname);
-    int ret = orig_faccessat(dirfd, r ? r : pathname, mode, flags);
-    if (r) free(r);
-    g_is_hooking = false;
-    return ret;
-}
-
-static int fake_mkdirat(int dirfd, const char *pathname, mode_t mode) {
-    if (g_is_hooking) return orig_mkdirat(dirfd, pathname, mode);
-    g_is_hooking = true;
-    char* r = get_redirected_path(pathname);
-    int ret = orig_mkdirat(dirfd, r ? r : pathname, mode);
-    if (r) free(r);
-    g_is_hooking = false;
-    return ret;
-}
-
-static int fake_fstatat(int dirfd, const char *pathname, struct stat *buf, int flags) {
-    if (g_is_hooking) return orig_fstatat(dirfd, pathname, buf, flags);
-    g_is_hooking = true;
-    char* r = get_redirected_path(pathname);
-    int ret = orig_fstatat(dirfd, r ? r : pathname, buf, flags);
-    if (r) free(r);
-    g_is_hooking = false;
-    return ret;
-}
-
-static int fake_access(const char *pathname, int mode) {
-    if (g_is_hooking) return orig_access(pathname, mode);
-    g_is_hooking = true;
-    char* r = get_redirected_path(pathname);
-    int ret = orig_access(r ? r : pathname, mode);
-    if (r) free(r);
-    g_is_hooking = false;
-    return ret;
-}
-
-static int fake_stat(const char *pathname, struct stat *buf) {
-    if (g_is_hooking) return orig_stat(pathname, buf);
-    g_is_hooking = true;
-    char* r = get_redirected_path(pathname);
-    int ret = orig_stat(r ? r : pathname, buf);
-    if (r) free(r);
-    g_is_hooking = false;
-    return ret;
-}
-
-static int fake_lstat(const char *pathname, struct stat *buf) {
-    if (g_is_hooking) return orig_lstat(pathname, buf);
-    g_is_hooking = true;
-    char* r = get_redirected_path(pathname);
-    int ret = orig_lstat(r ? r : pathname, buf);
-    if (r) free(r);
-    g_is_hooking = false;
-    return ret;
-}
-
-static int fake_getdents64(unsigned int fd, struct linux_dirent64 *dirp, unsigned int count) {
-    if (g_is_hooking) return orig_getdents64(fd, dirp, count);
-    int nread = orig_getdents64(fd, dirp, count);
-    if (nread <= 0) return nread;
-
-    g_is_hooking = true;
-    char path[PATH_MAX];
-    char procfd[64];
-    snprintf(procfd, sizeof(procfd), "/proc/self/fd/%d", fd);
-    ssize_t len = readlink(procfd, path, sizeof(path) - 1);
-    if (len > 0) {
-        path[len] = '\0';
-        if (strncmp(path, "/storage", 8) == 0) {
-            pthread_mutex_lock(&g_rules_mutex);
-            char* c_dir = normalize_path(path);
-            if (c_dir) {
-                int new_n = 0;
-                int pos = 0;
-                char* b = (char*)dirp;
-                while (pos < nread) {
-                    struct linux_dirent64 *d = (struct linux_dirent64 *)(b + pos);
-                    bool hide = false;
-                    for (size_t i = 0; i < g_rules.count; i++) {
-                        char* slash = strrchr(g_rules.rules[i].source, '/');
-                        if (slash) {
-                            size_t dlen = slash - g_rules.rules[i].source;
-                            if (strncmp(c_dir, g_rules.rules[i].source, dlen) == 0 &&
-                                c_dir[dlen] == '\0' &&
-                                strcmp(d->d_name, slash + 1) == 0) {
-                                hide = true; break;
-                            }
-                        }
-                    }
-                    if (!hide) {
-                        if (new_n != pos) memmove(b + new_n, b + pos, d->d_reclen);
-                        new_n += d->d_reclen;
-                    }
-                    pos += d->d_reclen;
-                }
-                nread = new_n;
-                free(c_dir);
-            }
-            pthread_mutex_unlock(&g_rules_mutex);
-        }
-    }
-    g_is_hooking = false;
-    return nread;
-}
-
-// ==========================================
-// Companion (Root 权限) - 通信核心
-// ==========================================
+// 此函数在 root 进程中运行，负责转发 App 的请求给 Injector 守护进程
 
 static void companion_handler(int client_fd) {
     char buf[1024];
-    // 读取 App 发来的请求
+    // 1. 读取 App 发来的请求 (格式: "REQ pkg_name pid")
     ssize_t len = read(client_fd, buf, sizeof(buf) - 1);
     if (len <= 0) { 
-        LOGE("Companion: 读取 App 请求失败或 EOF: %s", strerror(errno));
         close(client_fd); 
         return; 
     }
@@ -414,128 +63,57 @@ static void companion_handler(int client_fd) {
     
     char pkg_name[256];
     int pid = 0;
-    if (sscanf(buf, "REQ %255s %d", pkg_name, pid) != 2) {
-        LOGE("Companion: 请求格式错误: %s", buf);
+    if (sscanf(buf, "REQ %255s %d", pkg_name, &pid) != 2) {
+        LOGE("Companion: 请求格式解析失败: %s", buf);
         close(client_fd); 
         return;
     }
     
-    LOGD("Companion: 收到 App 请求: %s PID=%d", pkg_name, pid);
+    LOGI("Companion: 准备上报进程: %s (PID: %d)", pkg_name, pid);
 
-    // 1. 连接 Injector Socket
+    // 2. 连接外部 Injector Socket 并发送 REPORT
     int inj_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (inj_fd < 0) {
-        LOGE("Companion: 创建 Socket 失败: %s", strerror(errno));
-    } else {
+    if (inj_fd >= 0) {
         struct sockaddr_un addr = { .sun_family = AF_UNIX };
-        // 安全地复制路径
         strncpy(addr.sun_path, INJECTOR_SOCKET_PATH, sizeof(addr.sun_path) - 1);
         
-        // 设置 2 秒超时
-        struct timeval tv = { .tv_sec = 2, .tv_usec = 0 }; 
+        // 设置短超时
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 500000 }; 
         setsockopt(inj_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(inj_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        
-        LOGD("Companion: 尝试连接 Injector: %s", INJECTOR_SOCKET_PATH);
         
         if (connect(inj_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
             char report[512];
             snprintf(report, sizeof(report), "REPORT %s %d", pkg_name, pid);
             
-            LOGD("Companion: 发送 REPORT 指令...");
             if (write(inj_fd, report, strlen(report)) > 0) {
+                LOGD("Companion: 已向 Injector 发送 REPORT 指令");
+                
+                // 等待 Injector 确认（可选）
                 char resp[32];
-                LOGD("Companion: 等待 Injector 响应...");
-                ssize_t n = read(inj_fd, resp, sizeof(resp));
+                ssize_t n = read(inj_fd, resp, sizeof(resp) - 1);
                 if (n > 0) {
                     resp[n] = '\0';
                     LOGD("Companion: Injector 响应: %s", resp);
-                } else {
-                    LOGE("Companion: Injector 无响应或连接关闭");
                 }
-            } else {
-                LOGE("Companion: 发送数据失败: %s", strerror(errno));
             }
         } else {
-            // 这是最常见的错误点
-            LOGE("Companion: 连接 Injector 失败 (errno=%d): %s", errno, strerror(errno));
-            if (errno == ENOENT) LOGE("Companion: 提示 - Socket 文件不存在，Injector 未运行？");
-            if (errno == ECONNREFUSED) LOGE("Companion: 提示 - Injector 拒绝连接，是否在监听？");
-            if (errno == EACCES) LOGE("Companion: 提示 - 权限不足 (SELinux/chmod)");
+            LOGE("Companion: 无法连接 Injector (%s): %s", INJECTOR_SOCKET_PATH, strerror(errno));
         }
         close(inj_fd);
-    }
-    
-    // 2. 读取规则文件
-    char* rules_buf = (char*)malloc(32768); // 32KB
-    if (!rules_buf) {
-        LOGE("Companion: 内存分配失败");
-        close(client_fd);
-        return;
-    }
-    
-    strcpy(rules_buf, "SET_RULES:"); // 默认头
-    
-    int fd = open(RULES_FILE_PATH, O_RDONLY);
-    if (fd >= 0) {
-        ssize_t n = read(fd, rules_buf, 32767);
-        if (n > 0) rules_buf[n] = '\0';
-        close(fd);
-        LOGD("Companion: 读取到规则文件，长度: %zd", n);
     } else {
-        LOGE("Companion: 无法打开规则文件 %s: %s", RULES_FILE_PATH, strerror(errno));
+        LOGE("Companion: 创建 Socket 失败: %s", strerror(errno));
     }
     
-    // 3. 返回给 App
-    if (write(client_fd, rules_buf, strlen(rules_buf)) < 0) {
-        LOGE("Companion: 回传 App 失败: %s", strerror(errno));
-    } else {
-        LOGD("Companion: 握手完成，已回复 App");
-    }
-    
-    free(rules_buf);
+    // 3. 回复 App 表示处理完成
+    const char* ack = "OK";
+    write(client_fd, ack, strlen(ack));
     close(client_fd);
 }
 
 // ==========================================
-// Zygisk Module (App 进程)
+// Zygisk Module (App 进程运行)
 // ==========================================
-
-struct HotReloadArgs {
-    zygisk::Api* api;
-    char* pkg;
-    int pid;
-};
-
-static void* hot_reload_thread(void* arg) {
-    struct HotReloadArgs* args = (struct HotReloadArgs*)arg;
-    pthread_detach(pthread_self());
-    
-    char* buf = (char*)malloc(32768);
-    
-    while (1) {
-        sleep(10); 
-        int fd = args->api->connectCompanion();
-        if (fd >= 0) {
-            char req[512];
-            snprintf(req, sizeof(req), "REQ %s %d", args->pkg, args->pid);
-            if (write(fd, req, strlen(req)) > 0) {
-                if (buf) {
-                    ssize_t n = read(fd, buf, 32767);
-                    if (n > 0) {
-                        buf[n] = '\0';
-                        parse_rules_string(buf);
-                    }
-                }
-            }
-            close(fd);
-        }
-    }
-    if (buf) free(buf);
-    free(args->pkg);
-    free(args);
-    return NULL;
-}
 
 class AppReporterModule : public zygisk::ModuleBase {
 public:
@@ -545,103 +123,59 @@ public:
     }
     
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+        // 获取进程名
         const char* proc_raw = nullptr;
         if (args->nice_name) proc_raw = env->GetStringUTFChars(args->nice_name, nullptr);
         
-        this->pkg_name = proc_raw ? strdup(proc_raw) : strdup("unknown");
-        this->my_pid = getpid();
+        char* pkg = proc_raw ? strdup(proc_raw) : strdup("unknown");
+        int my_pid = getpid();
+        
         if (proc_raw) env->ReleaseStringUTFChars(args->nice_name, proc_raw);
 
-        this->should_hook = is_target_media_process(this->pkg_name);
+        // 过滤是否需要上报
+        if (!is_target_process(pkg)) {
+            free(pkg);
+            return;
+        }
 
-        LOGI("App [%s] 正在连接 Companion...", pkg_name);
+        LOGI("App [%s]: 启动上报流程...", pkg);
 
+        // 通过 Companion 进行上报
         int fd = api->connectCompanion();
         if (fd >= 0) {
             char req[512];
-            snprintf(req, sizeof(req), "REQ %s %d", pkg_name, my_pid);
+            snprintf(req, sizeof(req), "REQ %s %d", pkg, my_pid);
             
             if (write(fd, req, strlen(req)) > 0) {
-                // 阻塞等待
+                // 等待 Companion 完成处理（避免同步问题）
                 struct pollfd pfd = { .fd = fd, .events = POLLIN };
-                // 1秒超时
-                int ret = poll(&pfd, 1, 1000);
-                
-                if (ret > 0 && (pfd.revents & POLLIN)) {
-                    char* buf = (char*)malloc(32768);
-                    if (buf) {
-                        ssize_t n = read(fd, buf, 32767);
-                        if (n > 0) {
-                            buf[n] = '\0';
-                            if (should_hook) {
-                                LOGD("App: 收到规则数据，长度 %zd", n);
-                                parse_rules_string(buf);
-                            }
-                        } else {
-                            LOGE("App: 读取规则数据为空或失败: %s", strerror(errno));
-                        }
-                        free(buf);
-                    }
-                } else if (ret == 0) {
-                    LOGE("App: 等待 Injector 响应超时 (1000ms)");
+                if (poll(&pfd, 1, 2000) > 0) {
+                    LOGI("App [%s]: 上报成功", pkg);
                 } else {
-                    LOGE("App: poll 错误: %s", strerror(errno));
+                    LOGE("App [%s]: 上报超时", pkg);
                 }
             } else {
-                LOGE("App: 发送 REQ 失败: %s", strerror(errno));
+                LOGE("App [%s]: 写入 Companion 失败: %s", pkg, strerror(errno));
             }
             close(fd);
         } else {
-            LOGE("App: connectCompanion 失败，Zygisk API 异常？");
+            LOGE("App [%s]: 无法连接 Companion", pkg);
         }
+        
+        free(pkg);
     }
     
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        if (!should_hook) {
-            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-            free(pkg_name);
-            pkg_name = NULL;
-            return;
-        }
-        
-        LOGI("App [%s] 激活 Hook...", pkg_name);
-
-#ifdef USE_DOBBY
-        // --- 只有开启 Dobby 时才执行的代码 ---
-        void *h = dlopen("libc.so", RTLD_NOW);
-        if (h) {
-            #define H(n) do { void* s = dlsym(h, #n); if(s) DobbyHook(s, (void*)fake_##n, (void**)&orig_##n); } while(0)
-            H(openat); H(mkdirat); H(faccessat); H(fstatat); 
-            H(access); H(stat); H(lstat); H(getdents64);
-            dlclose(h);
-            g_hooks_installed = true;
-        } else {
-            LOGE("无法打开 libc.so: %s", dlerror());
-        }
-#else
-        // --- 如果 Dobby 被禁用 ---
-        LOGI("Dobby 功能已禁用，跳过 Hook 安装。");
-#endif
-
-        struct HotReloadArgs* t_args = (struct HotReloadArgs*)malloc(sizeof(struct HotReloadArgs));
-        if (t_args) {
-            t_args->api = api;
-            t_args->pkg = strdup(pkg_name);
-            t_args->pid = my_pid;
-            pthread_t tid;
-            if (pthread_create(&tid, NULL, hot_reload_thread, t_args) != 0) {
-                free(t_args->pkg); free(t_args);
-            }
-        }
+        // 由于不再需要 Hook 逻辑，上报完成后可以卸载该库以节省资源
+        // 如果你需要后续的定时轮询（Hot Reload），请删除下面这一行
+        api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }
     
 private:
     zygisk::Api *api;
     JNIEnv *env;
-    char* pkg_name = NULL;
-    int my_pid = 0;
-    bool should_hook = false;
 };
 
+// 注册 Zygisk 模块和 Companion 处理函数
 REGISTER_ZYGISK_MODULE(AppReporterModule)
 REGISTER_ZYGISK_COMPANION(companion_handler)
