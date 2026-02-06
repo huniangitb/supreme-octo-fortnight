@@ -5,7 +5,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <inttypes.h> // for SCNx64
-
+#include <sys/sysmacros.h>
 #include "zygisk.hpp"
 
 // ============================================================================
