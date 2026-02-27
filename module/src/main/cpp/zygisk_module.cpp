@@ -52,7 +52,9 @@ static void companion_handler(int client_fd) {
 
     char pkg_name[256];
     int pid = 0;
-    if (sscanf(buf, "REQ %255s %d", pkg_name, &pid) != 2) {
+    int uid = 0;  // 新增 UID 变量
+    // 修改 sscanf，增加 UID 的解析
+    if (sscanf(buf, "REQ %255s %d %d", pkg_name, &pid, &uid) != 3) {
         close(client_fd);
         return;
     }
@@ -71,9 +73,10 @@ static void companion_handler(int client_fd) {
 
         if (connect(inj_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
             char report_msg[512];
-            int msg_len = snprintf(report_msg, sizeof(report_msg), "REPORT %s %d", pkg_name, pid);
+            // 修改 REPORT 消息，增加 UID
+            int msg_len = snprintf(report_msg, sizeof(report_msg), "REPORT %s %d %d", pkg_name, pid, uid);
             if (write(inj_fd, report_msg, msg_len) > 0) {
-                LOGD("Companion: 已向 Injector 上报用户应用: %s (PID:%d)", pkg_name, pid);
+                LOGD("Companion: 已向 Injector 上报用户应用: %s (PID:%d, UID:%d)", pkg_name, pid, uid);
                 char ack[16];
                 read(inj_fd, ack, sizeof(ack));
             }
@@ -115,7 +118,8 @@ public:
         int fd = api->connectCompanion();
         if (fd >= 0) {
             char req_buf[512];
-            int req_len = snprintf(req_buf, sizeof(req_buf), "REQ %s %d", final_name, my_pid);
+            // 修改请求消息，增加 UID
+            int req_len = snprintf(req_buf, sizeof(req_buf), "REQ %s %d %d", final_name, my_pid, args->uid);
             
             if (write(fd, req_buf, req_len) > 0) {
                 struct pollfd pfd = { .fd = fd, .events = POLLIN };
