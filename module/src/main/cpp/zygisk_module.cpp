@@ -12,33 +12,32 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stddef.h>  // 添加 offsetof 支持
+#include <stddef.h>
 
 #include "zygisk.hpp"
 
-#define LOG_TAG "Zygisk_NSProxy"
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "[ERROR] " __VA_ARGS__)
+#define LOG_TAG "NSP_Zygisk"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// 使用抽象命名空间 socket，与 injector 匹配
 #define IPC_SOCKET_NAME "nsp_ipc_socket"
 
-// ==========================================
-// 辅助函数：根据 UID 判断是否为用户应用
-// ==========================================
-
-static bool is_user_app(uint32_t uid) {
+// 判定是否为需要注入的应用 UID
+static bool is_target_uid(uint32_t uid) {
     uint32_t app_id = uid % 100000;
-    return (app_id >= 10000 && app_id < 20000) || app_id >= 99000;
+    // 普通应用 (10000-19999) 或 某些系统的特定应用范围
+    return (app_id >= 10000 && app_id < 20000) || (app_id >= 99000);
 }
 
 // ==========================================
-// Companion (Root 权限运行)
+// Companion (Root 权限运行，负责中转)
 // ==========================================
 
 static void companion_handler(int client_fd) {
-    char buf[1024];
+    char buf[512];
+    struct timeval timeout = { .tv_sec = 0, .tv_usec = 300000 }; // 300ms 超时
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
     ssize_t len = read(client_fd, buf, sizeof(buf) - 1);
     if (len <= 0) {
         close(client_fd);
@@ -46,37 +45,29 @@ static void companion_handler(int client_fd) {
     }
     buf[len] = '\0';
 
-    char pkg_name[256];
-    int pid = 0;
-    int uid = 0;
-    if (sscanf(buf, "REQ %255s %d %d", pkg_name, &pid, &uid) != 3) {
-        close(client_fd);
-        return;
-    }
-
-    // 转发给 Injector (使用抽象命名空间)
+    // 转发给后台 Injector 服务
     int inj_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (inj_fd >= 0) {
-        struct sockaddr_un addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sun_family = AF_UNIX;
-        addr.sun_path[0] = '\0';  // 抽象命名空间
-        strncpy(addr.sun_path + 1, IPC_SOCKET_NAME, sizeof(addr.sun_path) - 2);
-        
+        struct sockaddr_un addr = { .sun_family = AF_UNIX };
+        addr.sun_path[0] = '\0'; // 抽象命名空间
+        memcpy(addr.sun_path + 1, IPC_SOCKET_NAME, strlen(IPC_SOCKET_NAME));
         socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(IPC_SOCKET_NAME);
 
-        struct timeval tv = { .tv_sec = 1, .tv_usec = 500000 };
-        setsockopt(inj_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(inj_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        // 设置极短的发送/连接超时，避免阻塞应用
+        setsockopt(inj_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        setsockopt(inj_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
         if (connect(inj_fd, (struct sockaddr*)&addr, addr_len) == 0) {
+            // 将 REQ 转换为 REPORT 协议发送
             char report_msg[512];
-            int msg_len = snprintf(report_msg, sizeof(report_msg), 
-                                 "REPORT %s %d %d", pkg_name, pid, uid);
-            if (write(inj_fd, report_msg, msg_len) > 0) {
-                LOGD("Companion: 已向 Injector 上报: %s (PID:%d, UID:%d)", 
-                     pkg_name, pid, uid);
-                char ack[16];
+            char pkg[256];
+            int pid, uid;
+            if (sscanf(buf, "REQ %s %d %d", pkg, &pid, &uid) == 3) {
+                int r_len = snprintf(report_msg, sizeof(report_msg), "REPORT %s %d %d", pkg, pid, uid);
+                write(inj_fd, report_msg, r_len);
+                
+                // 尝试读一个确认包，但不强求
+                char ack[8];
                 read(inj_fd, ack, sizeof(ack));
             }
         }
@@ -88,7 +79,7 @@ static void companion_handler(int client_fd) {
 }
 
 // ==========================================
-// Zygisk Module (App 进程运行)
+// Zygisk Module (注入 App 进程执行)
 // ==========================================
 
 class AppReporterModule : public zygisk::ModuleBase {
@@ -99,42 +90,40 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        // 使用 UID 判断是否为用户应用
-        if (!is_user_app(args->uid)) {
-            return; 
+        if (!is_target_uid(args->uid)) return;
+
+        const char* nice_name = nullptr;
+        if (args->nice_name != nullptr) {
+            nice_name = env->GetStringUTFChars(args->nice_name, nullptr);
         }
 
-        const char* nice_name = NULL;
-        if (args->nice_name != NULL) {
-            nice_name = env->GetStringUTFChars(args->nice_name, NULL);
+        if (!nice_name || strlen(nice_name) == 0) {
+            if (nice_name) env->ReleaseStringUTFChars(args->nice_name, nice_name);
+            return;
         }
-
-        const char* final_name = nice_name ? nice_name : "unknown";
-        int my_pid = getpid();
-
-        LOGI("App [%s] (UID: %u): 上报至 Injector...", final_name, args->uid);
 
         int fd = api->connectCompanion();
         if (fd >= 0) {
             char req_buf[512];
-            int req_len = snprintf(req_buf, sizeof(req_buf), 
-                                  "REQ %s %d %d", final_name, my_pid, args->uid);
+            int req_len = snprintf(req_buf, sizeof(req_buf), "REQ %s %d %d", nice_name, getpid(), args->uid);
             
-            if (write(fd, req_buf, req_len) > 0) {
-                struct pollfd pfd = { .fd = fd, .events = POLLIN };
-                poll(&pfd, 1, 1000);
-                LOGI("App [%s]: 上报完成", final_name);
+            // 发送通知
+            write(fd, req_buf, req_len);
+
+            // 限制等待响应的时间，防止 Companion 卡死导致 App 启动黑屏
+            struct pollfd pfd = { .fd = fd, .events = POLLIN };
+            if (poll(&pfd, 1, 200) > 0) {
+                char dummy[8];
+                read(fd, dummy, sizeof(dummy));
             }
             close(fd);
         }
 
-        if (nice_name) {
-            env->ReleaseStringUTFChars(args->nice_name, nice_name);
-        }
+        if (nice_name) env->ReleaseStringUTFChars(args->nice_name, nice_name);
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        // 卸载模块库以保持纯净
+        // 完成任务后立即卸载本库，减少内存占用
         api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }
 
