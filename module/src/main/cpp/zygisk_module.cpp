@@ -15,7 +15,7 @@
 #define LOG_TAG "MEDIA_XP_INTERNAL_RAW_IO"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-// ABI 补丁，防止无 C++ 标准库环境引发的链接异常
+// ABI 补丁，防止无 C++ 标准库引发链接崩溃
 extern "C" {
     void __cxa_pure_virtual() { while (1); }
 }
@@ -25,15 +25,13 @@ static int (*orig_ioctl)(int fd, int request, void *arg);
 static const char* MON_PATH = "/storage/emulated/0";
 static const size_t MON_LEN = 19;
 
-// 补齐 NDK 旧版头文件中可能缺失的 SG (Scatter-Gather) 结构体
-// Android 8.0+ 的 Binder 驱动通过增加 buffers_size 字段优化了内存映射
+// 补齐 SG 结构体
 struct my_binder_transaction_data_sg {
     struct binder_transaction_data tr;
     binder_size_t buffers_size;
 };
 
-// 动态合成 SG 指令码，彻底告别硬编码！
-// 完美兼容 32 位和 64 位的指针大小差异
+// 动态合成 SG 指令码
 static const uint32_t CMD_BR_TRANSACTION_SG = _IOR('r', 17, struct my_binder_transaction_data_sg);
 static const uint32_t CMD_BR_REPLY_SG = _IOR('r', 18, struct my_binder_transaction_data_sg);
 
@@ -83,30 +81,31 @@ static int my_ioctl(int fd, int request, void *arg) {
         unsigned char *end = p + bwr->read_consumed;
 
         while (p < end) {
+            // 提取当前指令
             uint32_t cmd = *(uint32_t *)p;
+            // 指针向后走 4 字节，跳过指令本身
             p += 4;
 
             if (cmd == BR_TRANSACTION || cmd == BR_REPLY) {
                 struct binder_transaction_data *tr = (struct binder_transaction_data *)p;
-                if (tr->data_size > 0 && tr->data.ptr.buffer) 
+                if (tr->data_size > 0 && tr->data.ptr.buffer) {
                     scan_parcel((void *)tr->data.ptr.buffer, tr->data_size, cmd, tr->code);
-                
-                // 基于已知结构体精确步进
+                }
+                // 精确步过载荷体
                 p += sizeof(struct binder_transaction_data);
             } 
             else if (cmd == CMD_BR_TRANSACTION_SG || cmd == CMD_BR_REPLY_SG) {
                 struct my_binder_transaction_data_sg *tr_sg = (struct my_binder_transaction_data_sg *)p;
-                if (tr_sg->tr.data_size > 0 && tr_sg->tr.data.ptr.buffer)
+                if (tr_sg->tr.data_size > 0 && tr_sg->tr.data.ptr.buffer) {
                     scan_parcel((void *)tr_sg->tr.data.ptr.buffer, tr_sg->tr.data_size, cmd, tr_sg->tr.code);
-                
-                // 基于已知 SG 结构体精确步进
+                }
                 p += sizeof(struct my_binder_transaction_data_sg);
             } 
             else {
-                // 致命漏洞修补：
-                // _IOC_SIZE 解析非数据指令（如 BR_NOOP等）会得出荒谬值，导致指针严重跑飞。
-                // 安全起见，一旦遇到非目标指令，直接舍弃剩余缓冲区，打破无限循环与越界崩溃的风险。
-                break;
+                // 正确的非目标指令跳过逻辑：
+                // 使用 _IOC_SIZE 提取内核宏定义的有效载荷大小，并保证 4 字节对齐
+                // 如果是 BR_NOOP 等无载荷指令，_IOC_SIZE 计算结果为 0，p += 0 是绝对安全的，因为前面的 p+=4 已经保证了循环前进
+                p += (_IOC_SIZE(cmd) + 3) & ~3;
             }
         }
     }
@@ -136,15 +135,30 @@ public:
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         if (!args->nice_name) return;
         const char *n = env->GetStringUTFChars(args->nice_name, 0);
-        if (n && strcmp(n, "com.android.providers.media.module") == 0) target = true;
-        env->ReleaseStringUTFChars(args->nice_name, n);
+        if (n) {
+            // 兼容新老 Android 版本的 MediaProvider 进程名
+            if (strcmp(n, "com.android.providers.media.module") == 0 ||
+                strcmp(n, "com.android.providers.media") == 0) {
+                target = true;
+            }
+            env->ReleaseStringUTFChars(args->nice_name, n);
+        }
     }
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
         if (!target) return;
+        
+        LOGI("--- 成功进入 MediaProvider 进程，正在寻找 libbinder.so ---");
+        
         dev_t d; ino_t i;
         if (get_lib_info("libbinder.so", &d, &i)) {
             api->pltHookRegister(d, i, "ioctl", (void *)my_ioctl, (void **)&orig_ioctl);
-            api->pltHookCommit();
+            if (api->pltHookCommit()) {
+                LOGI("+++ ioctl PLT Hook 注入成功！底线监听已开启 +++");
+            } else {
+                LOGI("!!! ioctl PLT Hook 提交失败 !!!");
+            }
+        } else {
+            LOGI("!!! 未能在内存中找到 libbinder.so !!!");
         }
     }
 };
