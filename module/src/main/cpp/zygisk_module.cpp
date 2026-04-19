@@ -15,57 +15,63 @@
 #define LOG_TAG "MEDIA_XP_INTERNAL_RAW_IO"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-// ABI 补丁，防止无 C++ 标准库引发链接崩溃
 extern "C" {
     void __cxa_pure_virtual() { while (1); }
 }
 
 static int (*orig_ioctl)(int fd, int request, void *arg);
 
-static const char* MON_PATH = "/storage/emulated/0";
-static const size_t MON_LEN = 19;
-
-// 补齐 SG 结构体
 struct my_binder_transaction_data_sg {
     struct binder_transaction_data tr;
     binder_size_t buffers_size;
 };
 
-// 动态合成 SG 指令码
 static const uint32_t CMD_BR_TRANSACTION_SG = _IOR('r', 17, struct my_binder_transaction_data_sg);
 static const uint32_t CMD_BR_REPLY_SG = _IOR('r', 18, struct my_binder_transaction_data_sg);
 
-static void scan_parcel(void *buffer, size_t size, uint32_t cmd, uint32_t code) {
-    if (!buffer || size < MON_LEN) return;
+// 宽带特征扫描器：抛弃死板的等长路径匹配，动态提取所有可能与存储相关的字符串
+static void scan_parcel_wide(void *buffer, size_t size, uint32_t cmd, uint32_t code) {
+    if (!buffer || size < 16) return;
     unsigned char *ptr = (unsigned char *)buffer;
 
-    for (size_t i = 0; i <= size - MON_LEN; i++) {
-        bool is_u8 = (ptr[i] == '/' && memcmp(ptr + i, MON_PATH, MON_LEN) == 0);
-        bool is_u16 = (ptr[i] == '/' && ptr[i+1] == 0 && i + MON_LEN*2 <= size);
-
-        if (is_u16) {
-            for (size_t j = 0; j < MON_LEN; j++) {
-                if (ptr[i + j*2] != MON_PATH[j] || ptr[i + j*2 + 1] != 0) { is_u16 = false; break; }
-            }
-        }
-
-        if (is_u8 || is_u16) {
-            char path[512] = {0};
-            size_t p_idx = 0;
-            size_t step = is_u8 ? 1 : 2;
+    // 1. 扫描 UTF-16 (标准的 Android Parcel 字符串)
+    for (size_t i = 0; i < size - 10; i += 2) {
+        // 通常以 / (路径), c (content), s (storage) 开头
+        if (ptr[i] == '/' || ptr[i] == 'c' || ptr[i] == 's') {
+            char buf[512] = {0};
+            size_t p = 0;
             size_t curr = i;
             
-            while (curr < size && p_idx < 511) {
-                unsigned short c = is_u8 ? ptr[curr] : (ptr[curr] | (ptr[curr+1] << 8));
+            while (curr + 1 < size && p < 511) {
+                unsigned short c = ptr[curr] | (ptr[curr+1] << 8);
                 if (c == 0 || c < 32 || c > 126) break;
-                path[p_idx++] = (char)c;
-                curr += step;
+                buf[p++] = (char)c;
+                curr += 2;
             }
-            if (p_idx >= MON_LEN) {
-                LOGI("[%s|C:%u] 监控命中: %s", 
-                    (cmd == BR_TRANSACTION || cmd == CMD_BR_TRANSACTION_SG) ? "REQ" : "REP", 
-                    code, path);
-                i = curr;
+            
+            // 提取长度大于 8，且包含存储核心关键词的字符串
+            if (p > 8 && (strstr(buf, "storage") || strstr(buf, "media") || strstr(buf, "content"))) {
+                LOGI("[Binder|C:%u] [UTF-16] %s", code, buf);
+                i = curr; 
+            }
+        }
+    }
+
+    // 2. 扫描 UTF-8 (Android 11+ Uri.writeToParcel 采用了 String8 优化)
+    for (size_t i = 0; i < size - 8; i++) {
+        if (ptr[i] == '/' || ptr[i] == 'c' || ptr[i] == 's') {
+            char buf[512] = {0};
+            size_t p = 0;
+            
+            while (i + p < size && p < 511) {
+                unsigned char c = ptr[i+p];
+                if (c == 0 || c < 32 || c > 126) break;
+                buf[p++] = (char)c;
+            }
+            
+            if (p > 8 && (strstr(buf, "storage") || strstr(buf, "media") || strstr(buf, "content"))) {
+                LOGI("[Binder|C:%u] [UTF-8 ] %s", code, buf);
+                i += p; 
             }
         }
     }
@@ -81,30 +87,24 @@ static int my_ioctl(int fd, int request, void *arg) {
         unsigned char *end = p + bwr->read_consumed;
 
         while (p < end) {
-            // 提取当前指令
             uint32_t cmd = *(uint32_t *)p;
-            // 指针向后走 4 字节，跳过指令本身
             p += 4;
 
             if (cmd == BR_TRANSACTION || cmd == BR_REPLY) {
                 struct binder_transaction_data *tr = (struct binder_transaction_data *)p;
                 if (tr->data_size > 0 && tr->data.ptr.buffer) {
-                    scan_parcel((void *)tr->data.ptr.buffer, tr->data_size, cmd, tr->code);
+                    scan_parcel_wide((void *)tr->data.ptr.buffer, tr->data_size, cmd, tr->code);
                 }
-                // 精确步过载荷体
                 p += sizeof(struct binder_transaction_data);
             } 
             else if (cmd == CMD_BR_TRANSACTION_SG || cmd == CMD_BR_REPLY_SG) {
                 struct my_binder_transaction_data_sg *tr_sg = (struct my_binder_transaction_data_sg *)p;
                 if (tr_sg->tr.data_size > 0 && tr_sg->tr.data.ptr.buffer) {
-                    scan_parcel((void *)tr_sg->tr.data.ptr.buffer, tr_sg->tr.data_size, cmd, tr_sg->tr.code);
+                    scan_parcel_wide((void *)tr_sg->tr.data.ptr.buffer, tr_sg->tr.data_size, cmd, tr_sg->tr.code);
                 }
                 p += sizeof(struct my_binder_transaction_data_sg);
             } 
             else {
-                // 正确的非目标指令跳过逻辑：
-                // 使用 _IOC_SIZE 提取内核宏定义的有效载荷大小，并保证 4 字节对齐
-                // 如果是 BR_NOOP 等无载荷指令，_IOC_SIZE 计算结果为 0，p += 0 是绝对安全的，因为前面的 p+=4 已经保证了循环前进
                 p += (_IOC_SIZE(cmd) + 3) & ~3;
             }
         }
@@ -136,7 +136,6 @@ public:
         if (!args->nice_name) return;
         const char *n = env->GetStringUTFChars(args->nice_name, 0);
         if (n) {
-            // 兼容新老 Android 版本的 MediaProvider 进程名
             if (strcmp(n, "com.android.providers.media.module") == 0 ||
                 strcmp(n, "com.android.providers.media") == 0) {
                 target = true;
@@ -148,17 +147,12 @@ public:
         if (!target) return;
         
         LOGI("--- 成功进入 MediaProvider 进程，正在寻找 libbinder.so ---");
-        
         dev_t d; ino_t i;
         if (get_lib_info("libbinder.so", &d, &i)) {
             api->pltHookRegister(d, i, "ioctl", (void *)my_ioctl, (void **)&orig_ioctl);
             if (api->pltHookCommit()) {
                 LOGI("+++ ioctl PLT Hook 注入成功！底线监听已开启 +++");
-            } else {
-                LOGI("!!! ioctl PLT Hook 提交失败 !!!");
             }
-        } else {
-            LOGI("!!! 未能在内存中找到 libbinder.so !!!");
         }
     }
 };
