@@ -12,6 +12,7 @@
 #include <sys/sysmacros.h>
 #include <sys/ioctl.h>
 #include <linux/android/binder.h>
+#include <pthread.h>
 
 #include "zygisk.hpp"
 
@@ -24,37 +25,28 @@ extern "C" {
     void __cxa_guard_release(long long *g) { *(char *)g = 1; }
 }
 
-// --- FUSE 相关定义 ---
 struct my_fuse_in_header {
     uint32_t len; uint32_t opcode; uint64_t unique; uint64_t nodeid;
     uint32_t uid; uint32_t gid; uint32_t pid; uint32_t padding;
 };
 
-// --- 全局原函数指针 ---
 static int (*orig_ioctl)(int fd, int request, void *arg);
 static int (*orig_openat)(int dirfd, const char *pathname, int flags, ...);
 static ssize_t (*orig_read)(int fd, void *buf, size_t count);
-static ssize_t (*orig_readv)(int fd, const struct iovec *iov, int iovcnt);
 
-// --- 线程局部变量 (跨上下文传递身份) ---
 static __thread uint32_t tl_uid = 0;
 static __thread uint32_t tl_pid = 0;
 
-// --- Binder SG 指令合成 ---
 struct my_binder_transaction_data_sg { struct binder_transaction_data tr; binder_size_t buffers_size; };
 static const uint32_t CMD_BR_TRANSACTION_SG = _IOR('r', 17, struct my_binder_transaction_data_sg);
 static const uint32_t CMD_BR_REPLY_SG = _IOR('r', 18, struct my_binder_transaction_data_sg);
 
-// ================= [逻辑段 1: Binder 扫描] =================
 static void scan_binder_parcel(void *buffer, size_t size, uint32_t cmd, struct binder_transaction_data *tr) {
     if (!buffer || size < 8) return;
     unsigned char *ptr = (unsigned char *)buffer;
-    // 双编码宽带扫描
     for (size_t i = 0; i < size - 8; i++) {
-        // 简单嗅探核心路径特征
         if (ptr[i] == '/' || ptr[i] == 'c' || ptr[i] == 's') {
             char path[512] = {0}; size_t p = 0;
-            // 尝试 UTF-8 和 UTF-16 降维提取
             bool is_u16 = (ptr[i+1] == 0);
             size_t step = is_u16 ? 2 : 1;
             size_t curr = i;
@@ -71,7 +63,6 @@ static void scan_binder_parcel(void *buffer, size_t size, uint32_t cmd, struct b
     }
 }
 
-// ================= [逻辑段 2: FUSE 身份解析] =================
 static ssize_t my_read(int fd, void *buf, size_t count) {
     ssize_t ret = orig_read(fd, buf, count);
     if (ret >= (ssize_t)sizeof(struct my_fuse_in_header)) {
@@ -81,23 +72,18 @@ static ssize_t my_read(int fd, void *buf, size_t count) {
     return ret;
 }
 
-// ================= [逻辑段 3: openat 最终拦截] =================
 static int my_openat(int dirfd, const char *pathname, int flags, ...) {
     mode_t mode = 0;
     if (flags & O_CREAT) { va_list a; va_start(a, flags); mode = va_arg(a, int); va_end(a); }
-    
     if (pathname && (strstr(pathname, "/data/media/") || strstr(pathname, "/storage/emulated/"))) {
         int fsuid = syscall(SYS_setfsuid, -1);
         uint32_t uid = (fsuid == (int)getuid() || fsuid < 0) ? tl_uid : (uint32_t)fsuid;
-        LOGI("[FUSE-OPEN] Path: %s | User: %d | AppId: %d | PID: %u", 
-             pathname, uid / 100000, uid % 100000, tl_pid);
+        LOGI("[FUSE-OPEN] Path: %s | User: %d | AppId: %d | PID: %u", pathname, uid / 100000, uid % 100000, tl_pid);
     }
-
     if (flags & O_CREAT) return orig_openat(dirfd, pathname, flags, mode);
     return orig_openat(dirfd, pathname, flags);
 }
 
-// ================= [逻辑段 4: ioctl 调度] =================
 static int my_ioctl(int fd, int request, void *arg) {
     if (request != BINDER_WRITE_READ) return orig_ioctl(fd, request, arg);
     struct binder_write_read *bwr = (struct binder_write_read *)arg;
@@ -121,24 +107,36 @@ static int my_ioctl(int fd, int request, void *arg) {
     return ret;
 }
 
-// ================= [逻辑段 5: Zygisk 生命周期] =================
 static void do_hook(zygisk::Api *api) {
+    LOGI("开始执行 PLT Hook 扫描...");
     FILE *f = fopen("/proc/self/maps", "r"); if (!f) return;
     char line[512];
+    int binder_hooked = 0, fuse_hooked = 0;
     while (fgets(line, sizeof(line), f)) {
         dev_t d; ino_t i; unsigned int ma, mi; unsigned long inv;
         if (sscanf(line, "%*x-%*x %*s %*x %x:%x %lu", &ma, &mi, &inv) != 3) continue;
         d = makedev(ma, mi); i = inv;
-        
-        if (strstr(line, "libbinder.so")) {
+        if (strstr(line, "libbinder.so") && !binder_hooked) {
             api->pltHookRegister(d, i, "ioctl", (void *)my_ioctl, (void **)&orig_ioctl);
-        } else if (strstr(line, "libmediaprovider_jni.so") || strstr(line, "libappfuse.so")) {
+            binder_hooked = 1; LOGI("找到 libbinder.so, 准备 Hook");
+        } else if ((strstr(line, "libmediaprovider_jni.so") || strstr(line, "libappfuse.so")) && !fuse_hooked) {
             api->pltHookRegister(d, i, "openat", (void *)my_openat, (void **)&orig_openat);
-            api->pltHookRegister(d, i, "openat64", (void *)my_openat, (void **)&orig_openat);
             api->pltHookRegister(d, i, "read", (void *)my_read, (void **)&orig_read);
+            fuse_hooked = 1; LOGI("找到 FUSE 相关库, 准备 Hook");
         }
     }
-    fclose(f); api->pltHookCommit();
+    fclose(f); 
+    if (api->pltHookCommit()) LOGI("PLT Hook 提交成功: Binder=%d, FUSE=%d", binder_hooked, fuse_hooked);
+}
+
+static void* heartbeat_worker(void* arg) {
+    zygisk::Api* api = (zygisk::Api*)arg;
+    for (int i = 0; i < 60; i++) {
+        LOGI("[HEARTBEAT] MediaMonitor 存活. PID: %d, Count: %d", getpid(), i);
+        if (i == 2) do_hook(api); // 延迟20秒二次尝试，防止库加载过慢
+        sleep(10);
+    }
+    return nullptr;
 }
 
 class MediaMonitor : public zygisk::ModuleBase {
@@ -147,11 +145,17 @@ public:
     void onLoad(zygisk::Api *a, JNIEnv *e) override { api = a; env = e; }
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         const char *n = env->GetStringUTFChars(args->nice_name, 0);
-        if (n && (strstr(n, "com.android.providers.media"))) target = true;
+        if (n && strstr(n, "com.android.providers.media")) target = true;
         env->ReleaseStringUTFChars(args->nice_name, n);
     }
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
-        if (target) { LOGI("MediaProvider 注入成功"); do_hook(api); }
+        if (target) {
+            LOGI("MediaProvider 注入成功，启动心跳线程");
+            pthread_t tid;
+            pthread_create(&tid, nullptr, heartbeat_worker, (void*)api);
+            pthread_detach(tid);
+            do_hook(api); 
+        }
     }
 };
 
