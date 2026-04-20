@@ -9,152 +9,126 @@
 #include <stdarg.h>
 #include <sys/uio.h>
 #include <sys/syscall.h>
-#include <sys/sysmacros.h>
-#include <sys/ioctl.h>
 #include <linux/android/binder.h>
 
 #include "zygisk.hpp"
 
-#define LOG_TAG "MEDIA_XP_INTERNAL_RAW_IO"
+#define LOG_TAG "MEDIA_STORAGE_SPY"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
+// ABI 兼容桩
 extern "C" {
     void __cxa_pure_virtual() { while (1); }
     int __cxa_guard_acquire(long long *g) { return !*(char *)(g); }
     void __cxa_guard_release(long long *g) { *(char *)g = 1; }
 }
 
-static int (*orig_ioctl)(int fd, int request, void *arg);
+// 标准 FUSE 请求头
+struct fuse_in_header {
+    uint32_t len;
+    uint32_t opcode;
+    uint64_t unique;
+    uint64_t nodeid;
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t pid;
+    uint32_t padding;
+};
+
+// 线程本地存储：缓存当前 FUSE 处理循环中的调用者身份
+static __thread struct {
+    uint32_t uid;
+    uint32_t pid;
+    uint32_t opcode;
+} current_caller = {0, 0, 0};
+
+static ssize_t (*orig_readv)(int fd, const struct iovec *iov, int iovcnt);
 static int (*orig_openat)(int dirfd, const char *pathname, int flags, ...);
 
-struct my_binder_transaction_data_sg { struct binder_transaction_data tr; binder_size_t buffers_size; };
-static const uint32_t CMD_BR_TRANSACTION_SG = _IOR('r', 17, struct my_binder_transaction_data_sg);
-static const uint32_t CMD_BR_REPLY_SG = _IOR('r', 18, struct my_binder_transaction_data_sg);
-
-// 宽带 Binder 提取器
-static void scan_binder_parcel(void *buffer, size_t size, uint32_t code) {
-    if (!buffer || size < 8) return;
-    unsigned char *ptr = (unsigned char *)buffer;
-    for (size_t i = 0; i < size - 8; i++) {
-        // 匹配常见开头的 UTF-16 或 UTF-8 字符串
-        if (ptr[i] == '/' || ptr[i] == 'c' || ptr[i] == 's') {
-            char path[512] = {0}; size_t p = 0;
-            bool is_u16 = (ptr[i+1] == 0);
-            size_t step = is_u16 ? 2 : 1;
-            size_t curr = i;
-            while (curr < size && p < 511) {
-                unsigned short c = is_u16 ? (ptr[curr] | (ptr[curr+1] << 8)) : ptr[curr];
-                if (c == 0 || c < 32 || c > 126) break;
-                path[p++] = (char)c; curr += step;
-            }
-            // 只要字符串够长，且包含核心要素，统统记录！
-            if (p > 10 && (strstr(path, "storage") || strstr(path, "content") || strstr(path, "media"))) {
-                LOGI("[BINDER] Code:%u | Extracted: %s", code, path);
-                i = curr;
-            }
+// 解析 FUSE 协议封包
+static void parse_fuse_buffer(void* base, size_t len) {
+    if (len >= sizeof(struct fuse_in_header)) {
+        struct fuse_in_header *hdr = (struct fuse_in_header *)base;
+        // 过滤常见的 FUSE 操作：LOOKUP(1), OPEN(14), CREATE(35), MKDIR(9)
+        if (hdr->opcode >= 1 && hdr->opcode <= 50) {
+            current_caller.uid = hdr->uid;
+            current_caller.pid = hdr->pid;
+            current_caller.opcode = hdr->opcode;
         }
     }
 }
 
-static int my_ioctl(int fd, int request, void *arg) {
-    if (request != BINDER_WRITE_READ) return orig_ioctl(fd, request, arg);
-    struct binder_write_read *bwr = (struct binder_write_read *)arg;
-    int ret = orig_ioctl(fd, request, arg);
-    if (ret >= 0 && bwr->read_consumed > 0) {
-        unsigned char *p = (unsigned char *)bwr->read_buffer;
-        unsigned char *end = p + bwr->read_consumed;
-        while (p < end) {
-            uint32_t cmd = *(uint32_t *)p; p += 4;
-            if (cmd == BR_TRANSACTION || cmd == BR_REPLY) {
-                struct binder_transaction_data *tr = (struct binder_transaction_data *)p;
-                if (tr->data_size > 0 && tr->data.ptr.buffer) scan_binder_parcel((void*)tr->data.ptr.buffer, tr->data_size, tr->code);
-                p += sizeof(struct binder_transaction_data);
-            } else if (cmd == CMD_BR_TRANSACTION_SG || cmd == CMD_BR_REPLY_SG) {
-                struct my_binder_transaction_data_sg *sg = (struct my_binder_transaction_data_sg *)p;
-                if (sg->tr.data_size > 0 && sg->tr.data.ptr.buffer) scan_binder_parcel((void*)sg->tr.data.ptr.buffer, sg->tr.data_size, sg->tr.code);
-                p += sizeof(struct my_binder_transaction_data_sg);
-            } else { p += (_IOC_SIZE(cmd) + 3) & ~3; }
-        }
+// 拦截 FUSE 消息读取
+static ssize_t my_readv(int fd, const struct iovec *iov, int iovcnt) {
+    ssize_t ret = orig_readv(fd, iov, iovcnt);
+    if (ret > 0 && iovcnt > 0 && iov[0].iov_base) {
+        parse_fuse_buffer(iov[0].iov_base, iov[0].iov_len);
     }
     return ret;
 }
 
+// 拦截物理文件打开
 static int my_openat(int dirfd, const char *pathname, int flags, ...) {
     mode_t mode = 0;
-    if (flags & O_CREAT) { va_list a; va_start(a, flags); mode = va_arg(a, int); va_end(a); }
-    
-    // 关键修复：FUSE 操作大量使用相对路径 (如 "DCIM/abc.jpg")，根本没有 storage 前缀！
-    // 过滤掉系统底层的噪音，放行并打印所有有价值的业务文件访问
-    if (pathname && !strstr(pathname, "/dev/") && !strstr(pathname, "/proc/") && 
-        !strstr(pathname, "/sys/") && !strstr(pathname, "/apex/")) {
-        LOGI("[FILE-ACCESS] dirfd: %d | path: %s", dirfd, pathname);
+    if (flags & O_CREAT) {
+        va_list args; va_start(args, flags);
+        mode = va_arg(args, int); va_end(args);
     }
 
-    if (flags & O_CREAT) return orig_openat(dirfd, pathname, flags, mode);
-    return orig_openat(dirfd, pathname, flags);
+    if (pathname && !strstr(pathname, "/dev/") && !strstr(pathname, "/proc/")) {
+        uint32_t uid = current_caller.uid;
+        // 如果 FUSE 没抓到，回退到 setfsuid 探测
+        if (uid == 0) uid = syscall(SYS_setfsuid, -1);
+        if (uid == getuid()) uid = 0; // 忽略 MediaProvider 自身的扫描操作
+
+        if (uid > 0) {
+            int user_id = uid / 100000;
+            int app_id = uid % 100000;
+            LOGI("[OPEN] User:%d | App:%d | PID:%u | Path:%s", 
+                 user_id, app_id, current_caller.pid, pathname);
+        }
+    }
+
+    return (flags & O_CREAT) ? orig_openat(dirfd, pathname, flags, mode) : orig_openat(dirfd, pathname, flags);
 }
 
-// 必须完全在 postAppSpecialize 生命周期内同步执行
 static void do_hook(zygisk::Api *api) {
-    FILE *f = fopen("/proc/self/maps", "r"); 
+    FILE *f = fopen("/proc/self/maps", "r");
     if (!f) return;
     char line[512];
-    unsigned long hooked_inodes[256] = {0};
-    int hooked_count = 0;
-
+    
     while (fgets(line, sizeof(line), f)) {
+        // 关键：在 Android 13 中，代码可能在 .apk 映射内，也可能在解压后的 .so 
+        if (!strstr(line, "r-xp")) continue;
+        if (!strstr(line, "/apex/com.android.mediaprovider") && 
+            !strstr(line, "libmediaprovider") &&
+            !strstr(line, "libappfuse.so")) continue;
+
         unsigned int ma, mi; unsigned long inv;
-        if (sscanf(line, "%*x-%*x %*s %*x %x:%x %lu", &ma, &mi, &inv) != 3) continue;
-        if (inv == 0) continue;
-
-        bool already = false;
-        for (int i = 0; i < hooked_count; i++) if (hooked_inodes[i] == inv) { already = true; break; }
-        if (already) continue;
-
-        dev_t d = makedev(ma, mi);
-
-        // 地毯式挂钩：将所有可能负责 I/O 和 IPC 的底层库全部套上钩子
-        if (strstr(line, "libbinder.so") || strstr(line, "libbinder_ndk.so") ||
-            strstr(line, "libmediaprovider") || strstr(line, "libappfuse.so") ||
-            strstr(line, "libfuse") || strstr(line, "libandroid_runtime.so") ||
-            strstr(line, "libbase.so") || strstr(line, "libutils.so") || strstr(line, "libmedia.so")) {
-            
-            api->pltHookRegister(d, inv, "ioctl", (void *)my_ioctl, (void **)&orig_ioctl);
+        if (sscanf(line, "%*x-%*x %*s %*x %x:%x %lu", &ma, &mi, &inv) == 3) {
+            dev_t d = makedev(ma, mi);
+            api->pltHookRegister(d, inv, "readv", (void *)my_readv, (void **)&orig_readv);
             api->pltHookRegister(d, inv, "openat", (void *)my_openat, (void **)&orig_openat);
             api->pltHookRegister(d, inv, "openat64", (void *)my_openat, (void **)&orig_openat);
-
-            hooked_inodes[hooked_count++] = inv;
-            
-            // 清理并打印被挂钩的库名
-            char* libname = strrchr(line, '/');
-            if (libname) {
-                char clean_name[64] = {0};
-                sscanf(libname + 1, "%63s", clean_name);
-                LOGI("注入目标库: %s (Inode: %lu)", clean_name, inv);
-            }
         }
     }
     fclose(f);
-    
-    // 强制打印 Commit 返回值
-    bool ret = api->pltHookCommit();
-    LOGI("+++ PLT Hook 提交结果: %s +++", ret ? "SUCCESS" : "FAILED");
+    api->pltHookCommit();
 }
 
 class MediaMonitor : public zygisk::ModuleBase {
-    zygisk::Api *api; JNIEnv *env; bool target = false;
+    zygisk::Api *api; JNIEnv *env; bool is_mp = false;
 public:
     void onLoad(zygisk::Api *a, JNIEnv *e) override { api = a; env = e; }
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        const char *n = env->GetStringUTFChars(args->nice_name, 0);
-        if (n && strstr(n, "com.android.providers.media")) target = true;
-        env->ReleaseStringUTFChars(args->nice_name, n);
+        const char *name = env->GetStringUTFChars(args->nice_name, 0);
+        if (name && strstr(name, "com.android.providers.media")) is_mp = true;
+        env->ReleaseStringUTFChars(args->nice_name, name);
     }
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
-        if (target) {
-            LOGI("=== MediaProvider 挂钩程序启动 ===");
-            // 立即同步执行，严禁放入任何延迟或后台线程！
-            do_hook(api); 
+        if (is_mp) {
+            LOGI("MediaProvider 拦截器激活...");
+            do_hook(api);
         }
     }
 };
