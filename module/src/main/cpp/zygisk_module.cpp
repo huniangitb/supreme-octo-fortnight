@@ -13,32 +13,31 @@
 #include <memory>
 #include "zygisk.hpp"
 #include "dobby.h"
-#include <unistd.h>
+
 #define LOG_TAG "FuseMonitor"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
 
 // ==========================================
-// RAII 封装 mmap 资源
+// RAII mmap 封装
 // ==========================================
 struct MappedFile {
     void*  addr   = nullptr;
     size_t length = 0;
 
     ~MappedFile() {
-        if (addr && addr != MAP_FAILED)
-            munmap(addr, length);
+        if (addr && addr != MAP_FAILED) munmap(addr, length);
     }
 
     MappedFile() = default;
     MappedFile(const MappedFile&) = delete;
     MappedFile& operator=(const MappedFile&) = delete;
-    MappedFile(MappedFile&& other) noexcept : addr(other.addr), length(other.length) {
-        other.addr = nullptr;
+    MappedFile(MappedFile&& rhs) noexcept : addr(rhs.addr), length(rhs.length) {
+        rhs.addr = nullptr;
     }
 };
 
@@ -48,10 +47,7 @@ static MappedFile map_file_readonly(const char* path) {
     if (fd < 0) return mf;
 
     struct stat st;
-    if (fstat(fd, &st) < 0) {
-        close(fd);
-        return mf;
-    }
+    if (fstat(fd, &st) < 0) { close(fd); return mf; }
 
     void* p = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
@@ -70,13 +66,9 @@ struct SymbolResult {
     std::string found_name;
 };
 
-// ==========================================
-// 增强的符号智能匹配
-// 1. 优先精确匹配 → 2. 包含关键词且在 mediaprovider::fuse 命名空间 → 3. 符号表回退 → 4. 重定位表
-// ==========================================
+// 增强的符号智能查找：精确 -> 包含关键词且属于 mediaprovider::fuse -> 宽泛包含 -> 失败
 static SymbolResult find_symbol_smart(const char* lib_path, uintptr_t base_addr, const std::string& target) {
     SymbolResult result;
-
     auto mf = map_file_readonly(lib_path);
     if (!mf.addr) {
         LOGE("Cannot mmap %s", lib_path);
@@ -84,7 +76,6 @@ static SymbolResult find_symbol_smart(const char* lib_path, uintptr_t base_addr,
     }
 
     auto* ehdr = (Elf64_Ehdr*)mf.addr;
-    // 基本校验
     if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 || ehdr->e_shoff == 0 || ehdr->e_shnum == 0) {
         LOGE("Invalid ELF header in %s", lib_path);
         return result;
@@ -93,16 +84,15 @@ static SymbolResult find_symbol_smart(const char* lib_path, uintptr_t base_addr,
     auto* shdrs = (Elf64_Shdr*)((uintptr_t)mf.addr + ehdr->e_shoff);
     auto* shstrtab = (const char*)((uintptr_t)mf.addr + shdrs[ehdr->e_shstrndx].sh_offset);
 
-    // 先收集所有符号表 section
     struct SymTabInfo {
-        Elf64_Sym* syms;
-        const char* strtab;
-        int count;
-        bool is_dynamic; // 动态符号表可能在 .dynsym，更可靠
+        Elf64_Sym*   syms;
+        const char*  strtab;
+        int          count;
+        bool         is_dynamic;
     };
     std::vector<SymTabInfo> symtabs;
 
-    for (int i = 0; i < ehdr->e_shnum; i++) {
+    for (int i = 0; i < ehdr->e_shnum; ++i) {
         if (shdrs[i].sh_type == SHT_SYMTAB || shdrs[i].sh_type == SHT_DYNSYM) {
             SymTabInfo info;
             info.syms = (Elf64_Sym*)((uintptr_t)mf.addr + shdrs[i].sh_offset);
@@ -113,7 +103,6 @@ static SymbolResult find_symbol_smart(const char* lib_path, uintptr_t base_addr,
         }
     }
 
-    // 多层匹配策略
     for (int pass = 0; pass < 3 && !result.address; ++pass) {
         for (const auto& tab : symtabs) {
             for (int j = 0; j < tab.count; ++j) {
@@ -123,37 +112,26 @@ static SymbolResult find_symbol_smart(const char* lib_path, uintptr_t base_addr,
 
                 bool match = false;
                 switch (pass) {
-                case 0: // 精确全词匹配
-                    match = (std::string(name) == target);
-                    break;
-                case 1: // 包含目标词且属 mediaprovider::fuse 命名空间
-                    match = (strstr(name, target.c_str()) != nullptr &&
-                             strstr(name, "mediaprovider") != nullptr &&
-                             strstr(name, "fuse") != nullptr);
-                    break;
-                case 2: // 宽泛匹配：只要包含目标词且符号长度合理
-                    match = (strstr(name, target.c_str()) != nullptr && strlen(name) > 10);
-                    break;
+                case 0: match = (std::string(name) == target); break;
+                case 1: match = (strstr(name, target.c_str()) != nullptr &&
+                                 strstr(name, "mediaprovider") != nullptr &&
+                                 strstr(name, "fuse") != nullptr);
+                        break;
+                case 2: match = (strstr(name, target.c_str()) != nullptr && strlen(name) > 10); break;
                 }
                 if (match) {
-                    result.address    = base_addr + sym.st_value;
+                    result.address = base_addr + sym.st_value;
                     result.found_name = name;
                     return result;
                 }
             }
         }
     }
-
-    // 回退：如果还是没找到，尝试通过 .rela.plt / .rela.dyn 重定位表寻找导入符号
-    // 这里仅检测 _ZL（静态内部链接），通常为 st_value 0，但有些符号表保留。
-    // 作为一个简单的 fallback，这里略过，实际可扩展特征码扫描。
     LOGE("Symbol resolution failed for '%s' in %s", target.c_str(), lib_path);
     return result;
 }
 
-// ==========================================
-// 解析 /proc/self/maps 获取模块基址和路径（增强版，处理路径含空格）
-// ==========================================
+// 解析 /proc/self/maps 获取模块基址和路径
 struct ModuleInfo {
     uintptr_t   base;
     std::string path;
@@ -167,17 +145,15 @@ static ModuleInfo find_module_in_maps(const char* soname) {
     char* line = nullptr;
     size_t len = 0;
     while (getline(&line, &len, fp) > 0) {
-        if (strstr(line, soname) == nullptr) continue;
+        if (!strstr(line, soname)) continue;
 
-        // 解析第一列地址和最后一列的完整路径（路径可能含空格，需要从最后一个'/'前提取）
         uintptr_t start = 0;
         if (sscanf(line, "%lx-", &start) != 1) continue;
 
-        // 找到行尾换行符，向前找最后一个 '/'，提取路径
         char* path_start = strrchr(line, '/');
         if (!path_start) continue;
-        char* newline = strchr(path_start, '\n');
-        if (newline) *newline = '\0';
+        char* nl = strchr(path_start, '\n');
+        if (nl) *nl = '\0';
 
         if (info.base == 0 || start < info.base) {
             info.base = start;
@@ -190,29 +166,161 @@ static ModuleInfo find_module_in_maps(const char* soname) {
 }
 
 // ==========================================
-// Hook 监控函数（不拦截，仅记录）
+// UID 提取 (fuse_req_t 偏移 0x3c)
 // ==========================================
-// 原始函数指针
-static void (*orig_pf_read)(void* req, uint64_t ino, size_t size, off_t off, void* fi) = nullptr;
-static void (*orig_pf_write)(void* req, uint64_t ino, const char* buf, size_t size, off_t off, void* fi) = nullptr;
-
-// UID 提取（偏移 0x3c 已验证）
 static uint32_t get_uid_from_fuse_req(void* req) {
     return *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(req) + 0x3c);
 }
 
+// ==========================================
+// 所有监控 Hook 的原型与原始函数指针
+// ==========================================
+// --- 文件/目录打开与关闭 ---
+static void (*orig_pf_open)(void* req, uint64_t ino, void* fi) = nullptr;
+static void (*orig_pf_opendir)(void* req, uint64_t ino, void* fi) = nullptr;
+static void (*orig_pf_release)(void* req, uint64_t ino, void* fi) = nullptr;
+static void (*orig_pf_releasedir)(void* req, uint64_t ino, void* fi) = nullptr;
+
+// --- 读写 ---
+static void (*orig_pf_read)(void* req, uint64_t ino, size_t size, off_t off, void* fi) = nullptr;
+static void (*orig_pf_write)(void* req, uint64_t ino, const char* buf, size_t size, off_t off, void* fi) = nullptr;
+
+// --- 枚举目录 ---
+static void (*orig_pf_readdir)(void* req, uint64_t ino, size_t size, off_t off, void* fi) = nullptr;
+static void (*orig_pf_readdirplus)(void* req, uint64_t ino, size_t size, off_t off, void* fi) = nullptr;
+
+// --- 创建 ---
+static void (*orig_pf_create)(void* req, uint64_t parent, const char* name, uint32_t mode, void* fi) = nullptr;
+static void (*orig_pf_mkdir)(void* req, uint64_t parent, const char* name, uint32_t mode) = nullptr;
+static void (*orig_pf_mknod)(void* req, uint64_t parent, const char* name, uint32_t mode, uint64_t rdev) = nullptr;
+
+// --- 删除 ---
+static void (*orig_pf_unlink)(void* req, uint64_t parent, const char* name) = nullptr;
+static void (*orig_pf_rmdir)(void* req, uint64_t parent, const char* name) = nullptr;
+
+// --- 重命名 ---
+static void (*orig_pf_rename)(void* req, uint64_t parent, const char* name, uint64_t newparent, const char* newname, uint32_t flags) = nullptr;
+
+// --- 属性获取 ---
+static void (*orig_pf_getattr)(void* req, uint64_t ino, void* fi) = nullptr;
+
+// --- 查找 ---
+static void (*orig_pf_lookup)(void* req, uint64_t parent, const char* name) = nullptr;
+
+// --- 辅助宏：打印名称（处理 nullptr） ---
+#define SAFE_STR(p) ((p) ? (p) : "(null)")
+
+// ==========================================
+// Hook 实现：仅记录，不拦截
+// ==========================================
+
+void hk_pf_open(void* req, uint64_t ino, void* fi) {
+    uint32_t uid = get_uid_from_fuse_req(req);
+    uint32_t flags = fi ? *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(fi) + 0x40) : 0;
+    LOGI("[OPEN] UID=%u | Inode=0x%llx | Flags=0x%x", uid, (unsigned long long)ino, flags);
+    if (orig_pf_open) orig_pf_open(req, ino, fi);
+}
+
+void hk_pf_opendir(void* req, uint64_t ino, void* fi) {
+    uint32_t uid = get_uid_from_fuse_req(req);
+    LOGI("[OPENDIR] UID=%u | Inode=0x%llx", uid, (unsigned long long)ino);
+    if (orig_pf_opendir) orig_pf_opendir(req, ino, fi);
+}
+
+void hk_pf_release(void* req, uint64_t ino, void* fi) {
+    uint32_t uid = get_uid_from_fuse_req(req);
+    LOGI("[RELEASE] UID=%u | Inode=0x%llx", uid, (unsigned long long)ino);
+    if (orig_pf_release) orig_pf_release(req, ino, fi);
+}
+
+void hk_pf_releasedir(void* req, uint64_t ino, void* fi) {
+    uint32_t uid = get_uid_from_fuse_req(req);
+    LOGI("[RELEASEDIR] UID=%u | Inode=0x%llx", uid, (unsigned long long)ino);
+    if (orig_pf_releasedir) orig_pf_releasedir(req, ino, fi);
+}
+
 void hk_pf_read(void* req, uint64_t ino, size_t size, off_t off, void* fi) {
     uint32_t uid = get_uid_from_fuse_req(req);
-    LOGI("[IO_READ] UID=%u | Inode=%llu | Size=%zu | Off=%lld",
+    LOGI("[READ] UID=%u | Inode=0x%llx | Size=%zu | Off=%lld",
          uid, (unsigned long long)ino, size, (long long)off);
     if (orig_pf_read) orig_pf_read(req, ino, size, off, fi);
 }
 
 void hk_pf_write(void* req, uint64_t ino, const char* buf, size_t size, off_t off, void* fi) {
     uint32_t uid = get_uid_from_fuse_req(req);
-    LOGI("[IO_WRITE] UID=%u | Inode=%llu | Size=%zu | Off=%lld",
+    LOGI("[WRITE] UID=%u | Inode=0x%llx | Size=%zu | Off=%lld",
          uid, (unsigned long long)ino, size, (long long)off);
     if (orig_pf_write) orig_pf_write(req, ino, buf, size, off, fi);
+}
+
+void hk_pf_readdir(void* req, uint64_t ino, size_t size, off_t off, void* fi) {
+    uint32_t uid = get_uid_from_fuse_req(req);
+    LOGI("[READDIR] UID=%u | Inode=0x%llx | Size=%zu | Off=%lld",
+         uid, (unsigned long long)ino, size, (long long)off);
+    if (orig_pf_readdir) orig_pf_readdir(req, ino, size, off, fi);
+}
+
+void hk_pf_readdirplus(void* req, uint64_t ino, size_t size, off_t off, void* fi) {
+    uint32_t uid = get_uid_from_fuse_req(req);
+    LOGI("[READDIRPLUS] UID=%u | Inode=0x%llx | Size=%zu | Off=%lld",
+         uid, (unsigned long long)ino, size, (long long)off);
+    if (orig_pf_readdirplus) orig_pf_readdirplus(req, ino, size, off, fi);
+}
+
+void hk_pf_create(void* req, uint64_t parent, const char* name, uint32_t mode, void* fi) {
+    uint32_t uid = get_uid_from_fuse_req(req);
+    LOGI("[CREATE] UID=%u | Parent=0x%llx | Name=%s | Mode=0%o",
+         uid, (unsigned long long)parent, SAFE_STR(name), mode);
+    if (orig_pf_create) orig_pf_create(req, parent, name, mode, fi);
+}
+
+void hk_pf_mkdir(void* req, uint64_t parent, const char* name, uint32_t mode) {
+    uint32_t uid = get_uid_from_fuse_req(req);
+    LOGI("[MKDIR] UID=%u | Parent=0x%llx | Name=%s | Mode=0%o",
+         uid, (unsigned long long)parent, SAFE_STR(name), mode);
+    if (orig_pf_mkdir) orig_pf_mkdir(req, parent, name, mode);
+}
+
+void hk_pf_mknod(void* req, uint64_t parent, const char* name, uint32_t mode, uint64_t rdev) {
+    uint32_t uid = get_uid_from_fuse_req(req);
+    LOGI("[MKNOD] UID=%u | Parent=0x%llx | Name=%s | Mode=0%o | Rdev=0x%llx",
+         uid, (unsigned long long)parent, SAFE_STR(name), mode, (unsigned long long)rdev);
+    if (orig_pf_mknod) orig_pf_mknod(req, parent, name, mode, rdev);
+}
+
+void hk_pf_unlink(void* req, uint64_t parent, const char* name) {
+    uint32_t uid = get_uid_from_fuse_req(req);
+    LOGI("[UNLINK] UID=%u | Parent=0x%llx | Name=%s",
+         uid, (unsigned long long)parent, SAFE_STR(name));
+    if (orig_pf_unlink) orig_pf_unlink(req, parent, name);
+}
+
+void hk_pf_rmdir(void* req, uint64_t parent, const char* name) {
+    uint32_t uid = get_uid_from_fuse_req(req);
+    LOGI("[RMDIR] UID=%u | Parent=0x%llx | Name=%s",
+         uid, (unsigned long long)parent, SAFE_STR(name));
+    if (orig_pf_rmdir) orig_pf_rmdir(req, parent, name);
+}
+
+void hk_pf_rename(void* req, uint64_t parent, const char* name, uint64_t newparent, const char* newname, uint32_t flags) {
+    uint32_t uid = get_uid_from_fuse_req(req);
+    LOGI("[RENAME] UID=%u | OldParent=0x%llx OldName=%s -> NewParent=0x%llx NewName=%s | Flags=0x%x",
+         uid, (unsigned long long)parent, SAFE_STR(name),
+         (unsigned long long)newparent, SAFE_STR(newname), flags);
+    if (orig_pf_rename) orig_pf_rename(req, parent, name, newparent, newname, flags);
+}
+
+void hk_pf_getattr(void* req, uint64_t ino, void* fi) {
+    uint32_t uid = get_uid_from_fuse_req(req);
+    LOGI("[GETATTR] UID=%u | Inode=0x%llx", uid, (unsigned long long)ino);
+    if (orig_pf_getattr) orig_pf_getattr(req, ino, fi);
+}
+
+void hk_pf_lookup(void* req, uint64_t parent, const char* name) {
+    uint32_t uid = get_uid_from_fuse_req(req);
+    LOGI("[LOOKUP] UID=%u | Parent=0x%llx | Name=%s",
+         uid, (unsigned long long)parent, SAFE_STR(name));
+    if (orig_pf_lookup) orig_pf_lookup(req, parent, name);
 }
 
 // ==========================================
@@ -222,73 +330,73 @@ class FuseMonitorModule : public zygisk::ModuleBase {
 public:
     void onLoad(Api* api, JNIEnv* env) override {
         this->api = api;
-        // 保存 JavaVM，供子线程使用 JNI（当前未使用，但保留）
         env->GetJavaVM(&jvm);
     }
 
     void preAppSpecialize(AppSpecializeArgs* args) override {
-        // 从 nice_name 获取进程名（此时在主线程，JNI 安全）
         const char* process = env->GetStringUTFChars(args->nice_name, nullptr);
         target_process = (process && std::strcmp(process, "com.android.providers.media.module") == 0);
         env->ReleaseStringUTFChars(args->nice_name, process);
         if (target_process) {
-            LOGI("Target MediaProvider process detected, will install hooks.");
+            LOGI("Target MediaProvider detected, hooks will be installed.");
         }
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs* args) override {
         if (!target_process) return;
-
-        std::thread([this]() {
-            install_hooks_async();
-        }).detach();
+        std::thread([this]() { install_all_hooks(); }).detach();
     }
 
 private:
-    Api*     api = nullptr;
-    JNIEnv*  env = nullptr;
-    JavaVM*  jvm = nullptr;
-    bool     target_process = false;
+    Api*    api = nullptr;
+    JNIEnv* env = nullptr;
+    JavaVM* jvm = nullptr;
+    bool    target_process = false;
 
-    void install_hooks_async() {
-        // 等待 libfuse_jni.so 加载
+    void install_all_hooks() {
         ModuleInfo mod;
-        for (int i = 0; i < 20; ++i) { // 最多等 10 秒
+        for (int i = 0; i < 20; ++i) {
             mod = find_module_in_maps("libfuse_jni.so");
             if (mod.base) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
         if (!mod.base) {
-            LOGE("libfuse_jni.so not loaded, aborting.");
+            LOGE("libfuse_jni.so not found, aborting.");
             return;
         }
-        LOGI("Found libfuse_jni.so base=%p path=%s", (void*)mod.base, mod.path.c_str());
+        LOGI("libfuse_jni.so base=%p path=%s", (void*)mod.base, mod.path.c_str());
 
-        // Hook pf_read
-        auto sym_read = find_symbol_smart(mod.path.c_str(), mod.base, "pf_read");
-        if (sym_read.address) {
-            LOGI("Resolved pf_read as '%s' @ %p", sym_read.found_name.c_str(), (void*)sym_read.address);
-            if (DobbyHook((void*)sym_read.address, (void*)hk_pf_read, (void**)&orig_pf_read) == 0) {
-                LOGI("pf_read hook installed successfully.");
+        // 辅助宏：尝试 hook 一个符号，失败只打印错误
+        auto try_hook = [&](const std::string& sym, void* hk_func, void** orig_ptr) {
+            auto res = find_symbol_smart(mod.path.c_str(), mod.base, sym);
+            if (res.address) {
+                LOGI("Hook %-12s -> %s @ %p", sym.c_str(), res.found_name.c_str(), (void*)res.address);
+                if (DobbyHook((void*)res.address, hk_func, orig_ptr) != 0) {
+                    LOGE("DobbyHook failed for %s", sym.c_str());
+                }
             } else {
-                LOGE("DobbyHook failed for pf_read.");
+                LOGE("Symbol not found: %s", sym.c_str());
             }
-        } else {
-            LOGE("Could not resolve pf_read symbol.");
-        }
+        };
 
-        // Hook pf_write
-        auto sym_write = find_symbol_smart(mod.path.c_str(), mod.base, "pf_write");
-        if (sym_write.address) {
-            LOGI("Resolved pf_write as '%s' @ %p", sym_write.found_name.c_str(), (void*)sym_write.address);
-            if (DobbyHook((void*)sym_write.address, (void*)hk_pf_write, (void**)&orig_pf_write) == 0) {
-                LOGI("pf_write hook installed successfully.");
-            } else {
-                LOGE("DobbyHook failed for pf_write.");
-            }
-        } else {
-            LOGE("Could not resolve pf_write symbol.");
-        }
+        try_hook("pf_open",           (void*)hk_pf_open,          (void**)&orig_pf_open);
+        try_hook("pf_opendir",        (void*)hk_pf_opendir,       (void**)&orig_pf_opendir);
+        try_hook("pf_release",        (void*)hk_pf_release,       (void**)&orig_pf_release);
+        try_hook("pf_releasedir",     (void*)hk_pf_releasedir,    (void**)&orig_pf_releasedir);
+        try_hook("pf_read",           (void*)hk_pf_read,          (void**)&orig_pf_read);
+        try_hook("pf_write",          (void*)hk_pf_write,         (void**)&orig_pf_write);
+        try_hook("pf_readdir",        (void*)hk_pf_readdir,       (void**)&orig_pf_readdir);
+        try_hook("pf_readdirplus",    (void*)hk_pf_readdirplus,   (void**)&orig_pf_readdirplus);
+        try_hook("pf_create",         (void*)hk_pf_create,        (void**)&orig_pf_create);
+        try_hook("pf_mkdir",          (void*)hk_pf_mkdir,         (void**)&orig_pf_mkdir);
+        try_hook("pf_mknod",          (void*)hk_pf_mknod,         (void**)&orig_pf_mknod);
+        try_hook("pf_unlink",         (void*)hk_pf_unlink,        (void**)&orig_pf_unlink);
+        try_hook("pf_rmdir",          (void*)hk_pf_rmdir,         (void**)&orig_pf_rmdir);
+        try_hook("pf_rename",         (void*)hk_pf_rename,        (void**)&orig_pf_rename);
+        try_hook("pf_getattr",        (void*)hk_pf_getattr,       (void**)&orig_pf_getattr);
+        try_hook("pf_lookup",         (void*)hk_pf_lookup,        (void**)&orig_pf_lookup);
+
+        LOGI("Hook installation complete (some may have failed due to symbol unavailability).");
     }
 };
 
