@@ -13,7 +13,7 @@
 #include <memory>
 #include "zygisk.hpp"
 #include "dobby.h"
-
+#include <unistd.h>
 #define LOG_TAG "FuseMonitor"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
