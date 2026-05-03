@@ -18,7 +18,7 @@ set(CMAKE_CXX_STANDARD 17)
 # ===================================================================
 # 2. 控制开关
 # ===================================================================
-option(ENABLE_DOBBY "Enable Dobby Hook Framework" OFF)
+option(ENABLE_DOBBY "Enable Dobby Hook Framework" ON)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
