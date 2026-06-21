@@ -54,7 +54,7 @@ endif ()
 
 # -fno-rtti -fno-exceptions: 彻底禁用 C++ 特性
 # -nostdlib++: 确保不使用任何 C++ 标准头文件路径（如果代码中误用了会报错）
-set(COMMON_FLAGS "-fdata-sections -ffunction-sections -fno-stack-protector -fvisibility=hidden")
+set(COMMON_FLAGS "-fdata-sections -ffunction-sections -fno-stack-protector -fvisibility=hidden -flto")
 set(CXX_ONLY_FLAGS "-fno-exceptions -fno-rtti -fno-use-cxa-atexit -fno-threadsafe-statics -fvisibility-inlines-hidden")
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${COMMON_FLAGS}")
@@ -63,7 +63,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${COMMON_FLAGS} ${CXX_ONLY_FLAGS}")
 # 链接器优化
 # --gc-sections: 移除未使用的代码段
 # --exclude-libs,ALL: 隐藏所有符号，防止冲突
-set(LINKER_FLAGS "-Wl,--gc-sections -Wl,--as-needed -Wl,--exclude-libs,ALL -Wl,-z,norelro -Wl,--hash-style=both")
+set(LINKER_FLAGS "-flto -Wl,--gc-sections -Wl,--as-needed -Wl,--exclude-libs,ALL -Wl,-z,norelro -Wl,--hash-style=both")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 
 # ===================================================================
