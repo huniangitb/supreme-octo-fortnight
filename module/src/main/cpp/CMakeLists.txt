@@ -16,10 +16,8 @@ set(ANDROID_STL "none")
 set(CMAKE_CXX_STANDARD 17)
 
 # ===================================================================
-# 2. 控制开关
+# 2. 源文件与依赖链接
 # ===================================================================
-option(ENABLE_DOBBY "Enable Dobby Hook Framework" OFF)
-
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 # 源文件
@@ -31,25 +29,11 @@ find_library(log-lib log)
 find_library(c-lib c)
 find_library(m-lib m)
 
-# ===================================================================
-# 3. 依赖链接配置
-# ===================================================================
-if (ENABLE_DOBBY)
-    message(STATUS "Dobby Hook is ENABLED")
-    add_library(dobby STATIC IMPORTED)
-    set_target_properties(dobby PROPERTIES
-        IMPORTED_LOCATION "${CMAKE_CURRENT_SOURCE_DIR}/${ANDROID_ABI}/libdobby.a"
-    )
-    target_link_libraries(${MODULE_NAME} dobby ${log-lib} ${c-lib} ${m-lib})
-    target_compile_definitions(${MODULE_NAME} PRIVATE USE_DOBBY)
-else ()
-    message(STATUS "Dobby Hook is DISABLED (Pure C Reporting Mode)")
-    # 仅链接日志库和基础 C 库
-    target_link_libraries(${MODULE_NAME} ${log-lib} ${c-lib} ${m-lib})
-endif ()
+# 仅链接日志库和基础 C 库
+target_link_libraries(${MODULE_NAME} ${log-lib} ${c-lib} ${m-lib})
 
 # ===================================================================
-# 4. 严苛的编译器标志 (最小化体积与稳定性)
+# 3. 严苛的编译器标志 (最小化体积与稳定性)
 # ===================================================================
 
 # -fno-rtti -fno-exceptions: 彻底禁用 C++ 特性
@@ -67,7 +51,7 @@ set(LINKER_FLAGS "-flto -Wl,--gc-sections -Wl,--as-needed -Wl,--exclude-libs,ALL
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 
 # ===================================================================
-# 5. 构建后处理 (Strip 符号表)
+# 4. 构建后处理 (Strip 符号表)
 # ===================================================================
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_custom_command(TARGET ${MODULE_NAME} POST_BUILD
